@@ -12,7 +12,7 @@ title: TiKV Weekly
 + Update Nightly Rust to the `rustc 1.12.0-nightly (7ad125c4e 2016-07-11)` version.
 
 ## Notable changes to `PD`
-+ Add a new field to `GetRegion` to return the region leader peer information so that clients can send requests to TiKV directly.
++ Add a new field to `GetRegion` to return the information about the leader of the peers within a region so that clients can send requests to TiKV directly.
 
 ## New contributors
 + [huachaohuang](https://github.com/huachaohuang)
