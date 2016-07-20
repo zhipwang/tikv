@@ -10,7 +10,7 @@ title:            TiKV
 tagline:          'TiKV Weekly'
 description:      'TiKV is a distributed Key-Value database which is based on the design of Google Spanner and HBase, but it is much simpler without dependency on any distributed file system.'
 url:              http://pingcap.github.com/tikv
-baseurl:          "/tikv/"
+baseurl:          "/tikv"
 
 author:
   name:           'PingCAP'
