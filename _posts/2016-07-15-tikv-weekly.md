@@ -5,7 +5,7 @@ title: TiKV Weekly
 
 ## Notable changes to `TiKV`
 + Move the transaction lock to a separated RocksDB column family for performance and to support GC later.
-+ Support human readable configuration parsing. Originally in the config file or the command flag, you need to use 107374182400, now you can simply use 100GiB. 
++ Support human readable configuration parsing. Originally in the config file or the command flag, you need to use 107374182400, now you can simply use 100GB. 
 + Port some raft changes from etcd. 
 + Add pushing down `sum` support for the coprocessor. 
 + Add asynchronous APIs support for better concurrent performance
