@@ -11,7 +11,7 @@ title: TiKV Weekly
 + Add asynchronous APIs support for better concurrent performance
 + Update Nightly Rust to the `rustc 1.12.0-nightly (7ad125c4e 2016-07-11)` version.
 
-## Notable changes to `PD`
+## Notable changes to `Placement Driver`
 + Add a new field to `GetRegion` to return the information about the leader of the peers within a region so that clients can send requests to TiKV directly.
 
 ## New contributors

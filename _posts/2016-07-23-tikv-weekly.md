@@ -13,7 +13,7 @@ Last week, we landed [15 PRs](https://github.com/pulls?utf8=%E2%9C%93&q=repo%3Ap
 + Re-use RocksDB write ahead log (WAL) to guarantee consistency when writing data in different column families.
 + Support using `make install` on the CentOS platform to install TiKV.
 
-## Notable changes to `PD`
+## Notable changes to `Placement Driver`
 
 + Refactor the balance framework to make a cluster more balanced and stable. 
 + Support web UI in Docker.
