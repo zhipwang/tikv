@@ -14,7 +14,7 @@ Last week, we landed [26 PRs](https://github.com/search?utf8=%E2%9C%93&q=repo%3A
 + Support the [Debug traits](https://github.com/pingcap/tikv/pull/986) for messages in the sending channel. 
 + Coprocessor uses [configuration](https://github.com/pingcap/tikv/pull/985) to make the endpoint threadpool size configurable.
 
-## Notable changes to `Placement DRIVER`
+## Notable changes to `Placement Driver`
 
 + Output the [version information](https://github.com/pingcap/pd/pull/279) when PD starts.
 + Save the [next timestamp oracle(TSO)](https://github.com/pingcap/pd/pull/290) to solve issue [#191](https://github.com/pingcap/pd/issues/191).
