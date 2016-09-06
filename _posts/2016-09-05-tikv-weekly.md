@@ -42,3 +42,7 @@ sysbench --test=./lua-tests/db/insert.lua --mysql-host=${host} --mysql-port=${po
 128|8960000|3422|37.39/70.10|4642|27.57/57.45|
 
 As we can see, the qps is increased by about 22%, and the latency is decreased by about 18%.
+
+## New contributors
+
++ [Dagang Wei](https://github.com/weidagang)
