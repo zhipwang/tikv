@@ -488,44 +488,45 @@ impl SelectContextCore {
         Ok(())
     }
 
-    fn get_group_key(&mut self) -> Result<Vec<u8>> {
-        let items = self.sel.get_group_by();
-        if items.is_empty() {
-            return Ok(SINGLE_GROUP.to_vec());
-        }
-        let mut vals = Vec::with_capacity(items.len());
-        for item in items {
-            let v = box_try!(self.eval.eval(item.get_expr()));
-            vals.push(v);
-        }
-        let res = box_try!(datum::encode_value(&vals));
-        Ok(res)
-    }
-
     fn aggregate(&mut self, h: i64, values: &HashMap<i64, &[u8]>) -> Result<()> {
         try!(inflate_with_col(&mut self.eval, values, &self.aggr_cols, h));
-        let gk = Rc::new(try!(self.get_group_key()));
+        let items = self.sel.get_group_by();
         let aggr_exprs = self.sel.get_aggregates();
-        match self.gk_aggrs.entry(gk.clone()) {
-            Entry::Occupied(e) => {
-                let funcs = e.into_mut();
-                for (expr, func) in aggr_exprs.iter().zip(funcs) {
-                    // TODO: cache args
-                    let args = box_try!(self.eval.batch_eval(expr.get_children()));
-                    try!(func.update(args));
-                }
-            }
-            Entry::Vacant(e) => {
+        let funcs = if items.is_empty() {
+            if self.gk_aggrs.is_empty() {
+                let gk = Rc::new(SINGLE_GROUP.to_vec());
                 let mut aggrs = Vec::with_capacity(aggr_exprs.len());
                 for expr in aggr_exprs {
-                    let mut aggr = try!(aggregate::build_aggr_func(expr));
-                    let args = box_try!(self.eval.batch_eval(expr.get_children()));
-                    try!(aggr.update(args));
-                    aggrs.push(aggr);
+                    aggrs.push(try!(aggregate::build_aggr_func(expr)));
                 }
+                self.gk_aggrs.insert(gk.clone(), aggrs);
                 self.gks.push(gk);
-                e.insert(aggrs);
             }
+            self.gk_aggrs.values_mut().next().unwrap()
+        } else {
+            let mut vals = Vec::with_capacity(items.len());
+            for item in items {
+                let v = box_try!(self.eval.eval(item.get_expr()));
+                vals.push(v);
+            }
+            let res = box_try!(datum::encode_value(&vals));
+            let gk = Rc::new(res);
+            match self.gk_aggrs.entry(gk.clone()) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => {
+                    self.gks.push(gk);
+                    let mut aggrs = Vec::with_capacity(aggr_exprs.len());
+                    for expr in aggr_exprs {
+                        aggrs.push(try!(aggregate::build_aggr_func(expr)));
+                    }
+                    e.insert(aggrs)
+                }
+            }
+        };
+        for (expr, func) in aggr_exprs.iter().zip(funcs) {
+            // TODO: cache args
+            let args = box_try!(self.eval.batch_eval(expr.get_children()));
+            try!(func.update(args));
         }
         Ok(())
     }
