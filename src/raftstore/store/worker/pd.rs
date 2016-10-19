@@ -15,15 +15,16 @@ use std::sync::Arc;
 use std::fmt::{self, Formatter, Display};
 
 use uuid::Uuid;
+use protobuf::RepeatedField;
 
 use kvproto::metapb;
 use kvproto::eraftpb::ConfChangeType;
-use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, AdminRequest, AdminCmdType};
+use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, AdminRequest, AdminCmdType,
+                          SplitRequest};
 use kvproto::raft_serverpb::RaftMessage;
 use kvproto::pdpb;
 
 use util::worker::Runnable;
-use util::escape;
 use util::transport::SendCh;
 use pd::PdClient;
 use raftstore::store::Msg;
@@ -36,7 +37,7 @@ use super::metrics::*;
 pub enum Task {
     AskSplit {
         region: metapb::Region,
-        split_key: Vec<u8>,
+        split_keys: Vec<Vec<u8>>,
         peer: metapb::Peer,
     },
     Heartbeat {
@@ -59,11 +60,11 @@ pub enum Task {
 impl Display for Task {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match *self {
-            Task::AskSplit { ref region, ref split_key, .. } => {
+            Task::AskSplit { ref region, ref split_keys, .. } => {
                 write!(f,
-                       "ask split region {} with key {}",
+                       "ask split region {} with keys {:?}",
                        region.get_id(),
-                       escape(&split_key))
+                       split_keys)
             }
             Task::Heartbeat { ref region, ref peer, .. } => {
                 write!(f,
@@ -123,24 +124,45 @@ impl<T: PdClient> Runner<T> {
         }
     }
 
-    fn handle_ask_split(&self, region: metapb::Region, split_key: Vec<u8>, peer: metapb::Peer) {
-        PD_REQ_COUNTER_VEC.with_label_values(&["ask split", "all"]).inc();
+    fn handle_ask_split(&self,
+                        region: metapb::Region,
+                        mut split_keys: Vec<Vec<u8>>,
+                        peer: metapb::Peer) {
+        let mut split_reqs = vec![];
+        let round = split_keys.len();
+        let mut keys_drain = split_keys.drain(..);
+        for _ in 0..round {
+            PD_REQ_COUNTER_VEC.with_label_values(&["ask split", "all"]).inc();
 
-        match self.pd_client.ask_split(region.clone()) {
-            Ok(mut resp) => {
-                info!("[region {}] try to split with new region id {} for region {:?}",
-                      region.get_id(),
-                      resp.get_new_region_id(),
-                      region);
-                PD_REQ_COUNTER_VEC.with_label_values(&["ask split", "success"]).inc();
+            // TODO: batch alloc
+            match self.pd_client.ask_split(region.clone()) {
+                Ok(mut resp) => {
+                    info!("[region {}] try to split with new region id {} for region {:?}",
+                          region.get_id(),
+                          resp.get_new_region_id(),
+                          region);
+                    PD_REQ_COUNTER_VEC.with_label_values(&["ask split", "success"]).inc();
 
-                let req = new_split_region_request(split_key,
-                                                   resp.get_new_region_id(),
-                                                   resp.take_new_peer_ids());
-                self.send_admin_request(region, peer, req);
+                    let req = new_split_region_request(keys_drain.next().unwrap(),
+                                                       resp.get_new_region_id(),
+                                                       resp.take_new_peer_ids());
+                    split_reqs.push(req);
+                }
+                Err(e) => debug!("[region {}] failed to ask split: {:?}", region.get_id(), e),
             }
-            Err(e) => debug!("[region {}] failed to ask split: {:?}", region.get_id(), e),
         }
+
+        if split_reqs.is_empty() {
+            warn!("[region {}] failed to fetch valid ids for split",
+                  region.get_id());
+            return;
+        }
+
+        let mut req = AdminRequest::new();
+        req.set_cmd_type(AdminCmdType::Split);
+        req.set_splits(RepeatedField::from_vec(split_reqs));
+
+        self.send_admin_request(region, peer, req);
     }
 
     fn handle_heartbeat(&self,
@@ -194,7 +216,6 @@ impl<T: PdClient> Runner<T> {
 
     fn handle_report_split(&self, left: metapb::Region, right: metapb::Region) {
         PD_REQ_COUNTER_VEC.with_label_values(&["report split", "all"]).inc();
-
         if let Err(e) = self.pd_client.report_split(left, right) {
             error!("report split failed {:?}", e);
         }
@@ -272,8 +293,8 @@ impl<T: PdClient> Runnable<Task> for Runner<T> {
         debug!("executing task {}", task);
 
         match task {
-            Task::AskSplit { region, split_key, peer } => {
-                self.handle_ask_split(region, split_key, peer)
+            Task::AskSplit { region, split_keys, peer } => {
+                self.handle_ask_split(region, split_keys, peer)
             }
             Task::Heartbeat { region, peer, down_peers } => {
                 self.handle_heartbeat(region, peer, down_peers)
@@ -296,12 +317,11 @@ fn new_change_peer_request(change_type: ConfChangeType, peer: metapb::Peer) -> A
 fn new_split_region_request(split_key: Vec<u8>,
                             new_region_id: u64,
                             peer_ids: Vec<u64>)
-                            -> AdminRequest {
-    let mut req = AdminRequest::new();
-    req.set_cmd_type(AdminCmdType::Split);
-    req.mut_split().set_split_key(split_key);
-    req.mut_split().set_new_region_id(new_region_id);
-    req.mut_split().set_new_peer_ids(peer_ids);
+                            -> SplitRequest {
+    let mut req = SplitRequest::new();
+    req.set_split_key(split_key);
+    req.set_new_region_id(new_region_id);
+    req.set_new_peer_ids(peer_ids);
     req
 }
 

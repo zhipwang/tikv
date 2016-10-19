@@ -590,7 +590,7 @@ impl<T: Simulator> Cluster<T> {
         }
     }
 
-    pub fn ask_split(&mut self, region: &metapb::Region, split_key: &[u8]) {
+    pub fn ask_split(&mut self, region: &metapb::Region, split_keys: &[&[u8]]) {
         // Now we can't control split easily in pd, so here we use store send channel
         // directly to send the AskSplit request.
         let leader = self.leader_of_region(region.get_id()).unwrap();
@@ -598,34 +598,36 @@ impl<T: Simulator> Cluster<T> {
         ch.try_send(Msg::SplitCheckResult {
                 region_id: region.get_id(),
                 epoch: region.get_region_epoch().clone(),
-                split_key: data_key(split_key),
+                split_keys: split_keys.into_iter().map(|k| data_key(k)).collect(),
             })
             .unwrap();
     }
 
-    pub fn must_split(&mut self, region: &metapb::Region, split_key: &[u8]) {
+    pub fn must_batch_split(&mut self, region: &metapb::Region, split_keys: Vec<&[u8]>) {
         let mut try_cnt = 0;
         let split_count = self.pd_client.get_split_count();
         loop {
             // In case ask split message is ignored, we should retry.
             if try_cnt % 50 == 0 {
                 self.reset_leader_of_region(region.get_id());
-                self.ask_split(region, split_key);
+                self.ask_split(region, &split_keys);
             }
 
-            if self.pd_client.check_split(region, split_key) &&
+            if self.pd_client.check_split(region, &split_keys) &&
                self.pd_client.get_split_count() > split_count {
                 return;
             }
 
             if try_cnt > 250 {
-                panic!("region {:?} has not been split by {:?}",
-                       region,
-                       escape(split_key));
+                panic!("region {:?} has not been split by {:?}", region, split_keys);
             }
             try_cnt += 1;
             sleep_ms(20);
         }
+    }
+
+    pub fn must_split(&mut self, region: &metapb::Region, split_key: &[u8]) {
+        self.must_batch_split(region, vec![split_key]);
     }
 
     // it's so common that we provide an API for it

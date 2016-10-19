@@ -435,30 +435,30 @@ impl TestPdClient {
     }
 
     // check whether region is split by split_key or not.
-    pub fn check_split(&self, region: &metapb::Region, split_key: &[u8]) -> bool {
+    #[allow(needless_range_loop)]
+    pub fn check_split(&self, old_region: &metapb::Region, split_keys: &[&[u8]]) -> bool {
         // E.g, 1 [a, c) -> 1 [a, b) + 2 [b, c)
         // use a to find new [a, b).
         // use b to find new [b, c)
-        let left = match self.get_region(region.get_start_key()) {
-            Err(_) => return false,
-            Ok(left) => left,
-        };
 
-        if left.get_end_key() != split_key {
-            return false;
+        let mut last_key = old_region.get_start_key().to_vec();
+        for i in 0..split_keys.len() + 1 {
+            let region = match self.get_region(&last_key) {
+                Err(_) => return false,
+                Ok(region) => region,
+            };
+            let key = if i == split_keys.len() {
+                region.get_end_key().to_vec()
+            } else {
+                split_keys[i].to_vec()
+            };
+            if region.get_end_key() != &*key {
+                return false;
+            }
+            assert!(region.get_region_epoch().get_version() >
+                    old_region.get_region_epoch().get_version());
+            last_key = key;
         }
-
-        let right = match self.get_region(split_key) {
-            Err(_) => return false,
-            Ok(right) => right,
-        };
-
-        if right.get_start_key() != split_key {
-            return false;
-        }
-
-        assert!(left.get_region_epoch().get_version() > region.get_region_epoch().get_version());
-        assert!(right.get_region_epoch().get_version() > region.get_region_epoch().get_version());
         true
     }
 

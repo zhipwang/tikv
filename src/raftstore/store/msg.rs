@@ -48,7 +48,7 @@ pub enum Msg {
     SplitCheckResult {
         region_id: u64,
         epoch: RegionEpoch,
-        split_key: Vec<u8>,
+        split_keys: Vec<Vec<u8>>,
     },
 
     ReportSnapshot {

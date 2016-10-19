@@ -77,7 +77,8 @@ impl Runnable<Task> for Runner {
         CHECK_SPILT_COUNTER_VEC.with_label_values(&["all"]).inc();
 
         let mut size = 0;
-        let mut split_key = vec![];
+        let mut total_size = 0;
+        let mut split_keys = vec![];
         let timer = CHECK_SPILT_HISTOGRAM.start_timer();
 
         let res = task.engine.scan(&task.start_key,
@@ -85,11 +86,14 @@ impl Runnable<Task> for Runner {
                                    &mut |k, v| {
             size += k.len() as u64;
             size += v.len() as u64;
-            if split_key.is_empty() && size > self.split_size {
-                split_key = k.to_vec();
+            if size > self.split_size {
+                split_keys.push(k.to_vec());
+                total_size += size;
+                size = 0;
             }
-            Ok(size < self.region_max_size)
+            Ok(true)
         });
+        total_size += size;
         if let Err(e) = res {
             error!("failed to scan split key of region {}: {:?}",
                    task.region_id,
@@ -99,7 +103,7 @@ impl Runnable<Task> for Runner {
 
         timer.observe_duration();
 
-        if size < self.region_max_size {
+        if total_size < self.region_max_size {
             debug!("[region {}] no need to send for {} < {}",
                    task.region_id,
                    size,
@@ -108,7 +112,7 @@ impl Runnable<Task> for Runner {
             CHECK_SPILT_COUNTER_VEC.with_label_values(&["ignore"]).inc();
             return;
         }
-        let res = self.ch.try_send(new_split_check_result(task.region_id, task.epoch, split_key));
+        let res = self.ch.try_send(new_split_check_result(task.region_id, task.epoch, split_keys));
         if let Err(e) = res {
             warn!("[region {}] failed to send check result, err {:?}",
                   task.region_id,
@@ -119,10 +123,10 @@ impl Runnable<Task> for Runner {
     }
 }
 
-fn new_split_check_result(region_id: u64, epoch: RegionEpoch, split_key: Vec<u8>) -> Msg {
+fn new_split_check_result(region_id: u64, epoch: RegionEpoch, split_keys: Vec<Vec<u8>>) -> Msg {
     Msg::SplitCheckResult {
         region_id: region_id,
         epoch: epoch,
-        split_key: split_key,
+        split_keys: split_keys,
     }
 }

@@ -20,7 +20,7 @@ use std::default::Default;
 use std::time::{Instant, Duration};
 
 use rocksdb::{DB, WriteBatch, Writable};
-use protobuf::{self, Message};
+use protobuf::{self, Message, RepeatedField};
 use uuid::Uuid;
 
 use kvproto::metapb;
@@ -71,10 +71,7 @@ pub enum ExecResult {
         region: metapb::Region,
     },
     CompactLog { state: RaftTruncatedState },
-    SplitRegion {
-        left: metapb::Region,
-        right: metapb::Region,
-    },
+    SplitRegion { regions: Vec<metapb::Region> },
 }
 
 // When we apply commands in handing ready, we should also need a way to
@@ -1021,8 +1018,8 @@ impl Peer {
                             storage.region = region.clone();
                         }
                         ExecResult::CompactLog { .. } => {}
-                        ExecResult::SplitRegion { ref right, .. } => {
-                            storage.region = right.clone();
+                        ExecResult::SplitRegion { ref regions, .. } => {
+                            storage.region = regions.last().unwrap().clone();
                         }
                     }
                 };
@@ -1213,70 +1210,70 @@ impl Peer {
                   -> Result<(AdminResponse, Option<ExecResult>)> {
         PEER_ADMIN_CMD_COUNTER_VEC.with_label_values(&["split", "all"]).inc();
 
-        let split_req = req.get_split();
-        if !split_req.has_split_key() {
-            return Err(box_err!("missing split key"));
+        if req.get_splits().is_empty() {
+            return Err(box_err!("missing split requests"));
         }
-
-        let split_key = split_req.get_split_key();
+        let mut regions = Vec::with_capacity(req.get_splits().len());
         let mut region = self.region().clone();
-        if split_key <= region.get_start_key() {
-            return Err(box_err!("invalid split request: {:?}", split_req));
-        }
-
-        try!(util::check_key_in_region(split_key, &region));
-
-        info!("{} split at key: {}, region: {:?}",
-              self.tag,
-              escape(split_key),
-              region);
-
-        // TODO: check new region id validation.
-        let new_region_id = split_req.get_new_region_id();
-
-        // After split, the origin region key range is [split_key, end_key),
-        // the new split region is [start_key, split_key).
-        let mut new_region = region.clone();
-        region.set_start_key(split_key.to_vec());
-
-        new_region.set_end_key(split_key.to_vec());
-        new_region.set_id(new_region_id);
-
-        // Update new region peer ids.
-        let new_peer_ids = split_req.get_new_peer_ids();
-        if new_peer_ids.len() != new_region.get_peers().len() {
-            return Err(box_err!("invalid new peer id count, need {}, but got {}",
-                                new_region.get_peers().len(),
-                                new_peer_ids.len()));
-        }
-
-        for (index, peer) in new_region.mut_peers().iter_mut().enumerate() {
-            let peer_id = new_peer_ids[index];
-            peer.set_id(peer_id);
-
-            // Add this peer to cache.
-            self.peer_cache.borrow_mut().insert(peer_id, peer.clone());
-        }
-
         // update region version
         let region_ver = region.get_region_epoch().get_version() + 1;
         region.mut_region_epoch().set_version(region_ver);
-        new_region.mut_region_epoch().set_version(region_ver);
+        for split_req in req.get_splits() {
+            if !split_req.has_split_key() {
+                return Err(box_err!("missing split key"));
+            }
+
+            let split_key = split_req.get_split_key();
+            if split_key <= region.get_start_key() {
+                return Err(box_err!("invalid split request: {:?}", split_req));
+            }
+
+            try!(util::check_key_in_region(split_key, &region));
+
+            info!("{} split at key: {}, region: {:?}",
+                  self.tag,
+                  escape(split_key),
+                  region);
+
+            // TODO: check new region id validation.
+            let new_region_id = split_req.get_new_region_id();
+
+            // After split, the origin region key range is [split_key, end_key),
+            // the new split region is [start_key, split_key).
+            let mut new_region = region.clone();
+            region.set_start_key(split_key.to_vec());
+
+            new_region.set_end_key(split_key.to_vec());
+            new_region.set_id(new_region_id);
+
+            // Update new region peer ids.
+            let new_peer_ids = split_req.get_new_peer_ids();
+            if new_peer_ids.len() != new_region.get_peers().len() {
+                return Err(box_err!("invalid new peer id count, need {}, but got {}",
+                                    new_region.get_peers().len(),
+                                    new_peer_ids.len()));
+            }
+
+            for (index, peer) in new_region.mut_peers().iter_mut().enumerate() {
+                let peer_id = new_peer_ids[index];
+                peer.set_id(peer_id);
+
+                // Add this peer to cache.
+                self.peer_cache.borrow_mut().insert(peer_id, peer.clone());
+            }
+            try!(write_peer_state(&ctx.wb, &new_region, PeerState::Normal));
+            try!(write_initial_state(self.engine.as_ref(), &ctx.wb, new_region.get_id()));
+            regions.push(new_region);
+        }
         try!(write_peer_state(&ctx.wb, &region, PeerState::Normal));
-        try!(write_peer_state(&ctx.wb, &new_region, PeerState::Normal));
-        try!(write_initial_state(self.engine.as_ref(), &ctx.wb, new_region.get_id()));
+        regions.push(region);
 
         let mut resp = AdminResponse::new();
-        resp.mut_split().set_left(new_region.clone());
-        resp.mut_split().set_right(region.clone());
+        resp.mut_split().set_regions(RepeatedField::from_vec(regions.clone()));
 
         PEER_ADMIN_CMD_COUNTER_VEC.with_label_values(&["split", "success"]).inc();
 
-        Ok((resp,
-            Some(ExecResult::SplitRegion {
-            left: new_region,
-            right: region,
-        })))
+        Ok((resp, Some(ExecResult::SplitRegion { regions: regions })))
     }
 
     fn exec_compact_log(&mut self,

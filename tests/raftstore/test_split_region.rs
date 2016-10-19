@@ -144,7 +144,7 @@ fn test_auto_split_region<T: Simulator>(cluster: &mut Cluster<T>) {
                                   &mut range);
     let max_key = cmp::max(last_key, final_key);
 
-    thread::sleep(Duration::from_secs(1));
+    thread::sleep(Duration::from_secs(5));
 
     let left = pd_client.get_region(b"").unwrap();
     let right = pd_client.get_region(&max_key).unwrap();
@@ -537,3 +537,5 @@ fn test_node_split_stale_epoch() {
     let mut cluster = new_node_cluster(0, 3);
     test_split_stale_epoch(&mut cluster);
 }
+
+// TODO: add more tests

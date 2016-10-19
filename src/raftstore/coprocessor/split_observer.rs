@@ -28,6 +28,25 @@ pub struct SplitObserver;
 type Result<T> = StdResult<T, String>;
 
 impl SplitObserver {
+    fn on_splits(&mut self,
+                 ctx: &mut ObserverContext,
+                 splits: Vec<SplitRequest>)
+                 -> Result<Vec<SplitRequest>> {
+        let mut last_key = vec![];
+        let mut res = Vec::with_capacity(splits.len());
+        for mut split in splits {
+            try!(self.on_split(ctx, &mut split));
+            if split.get_split_key() > &last_key {
+                last_key = split.get_split_key().to_vec();
+                res.push(split);
+            }
+        }
+        if res.is_empty() {
+            return Err("no need to split".to_owned());
+        }
+        Ok(res)
+    }
+
     fn on_split(&mut self, ctx: &mut ObserverContext, split: &mut SplitRequest) -> Result<()> {
         if !split.has_split_key() {
             return Err("split key is expected!".to_owned());
@@ -70,14 +89,17 @@ impl RegionObserver for SplitObserver {
         if req.get_cmd_type() != AdminCmdType::Split {
             return Ok(());
         }
-        if !req.has_split() {
+        if req.get_splits().is_empty() {
             box_try!(Err("cmd_type is Split but it doesn't have split request, message maybe \
                           corrupted!"
                 .to_owned()));
         }
-        if let Err(e) = self.on_split(ctx, req.mut_split()) {
-            error!("failed to handle split req: {:?}", e);
-            return Err(box_err!(e));
+        match self.on_splits(ctx, req.take_splits().into_vec()) {
+            Err(e) => {
+                error!("failed to handle split req: {:?}", e);
+                return Err(box_err!(e));
+            }
+            Ok(splits) => req.set_splits(RepeatedField::from_vec(splits)),
         }
         Ok(())
     }
@@ -133,7 +155,7 @@ mod test {
         req.set_cmd_type(AdminCmdType::Split);
         let mut split_req = SplitRequest::new();
         split_req.set_split_key(key.to_vec());
-        req.set_split(split_req);
+        req.mut_splits().push(split_req);
         req
     }
 
@@ -175,8 +197,10 @@ mod test {
         observer.pre_admin(&mut ctx, &mut req).unwrap();
         let expect_key = new_row_key(256, 2, 0, 0);
         let len = expect_key.len();
-        assert_eq!(req.get_split().get_split_key(), &expect_key[..len - 8]);
+        assert_eq!(req.get_splits()[0].get_split_key(), &expect_key[..len - 8]);
     }
+
+    // TODO: add more tests
 
     #[test]
     fn test_split() {
@@ -190,45 +214,46 @@ mod test {
         let resp = observer.pre_admin(&mut ctx, &mut req);
         // since no split is defined, actual coprocessor won't be invoke.
         assert!(resp.is_ok());
-        assert!(!req.has_split(), "only split req should be handle.");
+        assert!(req.get_splits().is_empty(),
+                "only split req should be handle.");
 
         req = new_split_request(b"test");
         assert!(observer.pre_admin(&mut ctx, &mut req).is_ok());
-        assert_eq!(req.get_split().get_split_key(), b"test");
+        assert_eq!(req.get_splits()[0].get_split_key(), b"test");
 
         let mut key = encode_bytes(b"db:1");
         key.write_u64::<BigEndian>(0).unwrap();
         let mut expect_key = encode_bytes(b"db:1");
         req = new_split_request(&key);
         assert!(observer.pre_admin(&mut ctx, &mut req).is_ok());
-        assert_eq!(req.get_split().get_split_key(), &*expect_key);
+        assert_eq!(req.get_splits()[0].get_split_key(), &*expect_key);
 
         key = new_row_key(1, 2, 0, 0);
         req = new_split_request(&key);
         expect_key = key[..key.len() - 8].to_vec();
         assert!(observer.pre_admin(&mut ctx, &mut req).is_ok());
-        assert_eq!(req.get_split().get_split_key(), &*expect_key);
+        assert_eq!(req.get_splits()[0].get_split_key(), &*expect_key);
 
         key = new_row_key(1, 2, 1, 0);
         req = new_split_request(&key);
         assert!(observer.pre_admin(&mut ctx, &mut req).is_ok());
-        assert_eq!(req.get_split().get_split_key(), &*expect_key);
+        assert_eq!(req.get_splits()[0].get_split_key(), &*expect_key);
 
         key = new_row_key(1, 2, 1, 1);
         req = new_split_request(&key);
         assert!(observer.pre_admin(&mut ctx, &mut req).is_ok());
-        assert_eq!(req.get_split().get_split_key(), &*expect_key);
+        assert_eq!(req.get_splits()[0].get_split_key(), &*expect_key);
 
         key = new_index_key(1, 2, &[Datum::I64(1), Datum::Bytes(b"brgege".to_vec())], 0);
         req = new_split_request(&key);
         expect_key = key[..key.len() - 8].to_vec();
         assert!(observer.pre_admin(&mut ctx, &mut req).is_ok());
-        assert_eq!(req.get_split().get_split_key(), &*expect_key);
+        assert_eq!(req.get_splits()[0].get_split_key(), &*expect_key);
 
         key = new_index_key(1, 2, &[Datum::I64(1), Datum::Bytes(b"brgege".to_vec())], 5);
         req = new_split_request(&key);
         observer.pre_admin(&mut ctx, &mut req).unwrap();
-        assert_eq!(req.get_split().get_split_key(), &*expect_key);
+        assert_eq!(req.get_splits()[0].get_split_key(), &*expect_key);
 
         expect_key =
             encode_bytes(b"t\x80\x00\x00\x00\x00\x00\x00\xea_r\x80\x00\x00\x00\x00\x05\x82\x7f");
@@ -236,6 +261,6 @@ mod test {
         key.extend_from_slice(b"\x80\x00\x00\x00\x00\x00\x00\xd3");
         req = new_split_request(&key);
         observer.pre_admin(&mut ctx, &mut req).unwrap();
-        assert_eq!(req.get_split().get_split_key(), &*expect_key);
+        assert_eq!(req.get_splits()[0].get_split_key(), &*expect_key);
     }
 }
