@@ -764,6 +764,9 @@ impl Peer {
         send_msg.set_message(msg.clone());
         // set current epoch
         send_msg.set_region_epoch(self.region().get_region_epoch().clone());
+        if self.get_store().is_initialized() {
+            send_msg.set_end_key(self.get_store().get_region().get_end_key().to_vec());
+        }
         let mut unreachable = false;
 
         let from_peer = match self.get_peer_from_cache(msg.get_from()) {

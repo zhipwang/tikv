@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::option::Option;
 use std::collections::{HashMap, HashSet, BTreeMap};
 use std::boxed::Box;
-use std::collections::Bound::{Excluded, Unbounded};
+use std::collections::Bound::{Excluded, Unbounded, Included};
 use std::time::{Duration, Instant};
 use std::{cmp, u64};
 
@@ -47,7 +47,7 @@ use storage::{ALL_CFS, CF_LOCK};
 use super::worker::{SplitCheckRunner, SplitCheckTask, RegionTask, RegionRunner, CompactTask,
                     CompactRunner, PdRunner, PdTask};
 use super::{util, Msg, Tick, SnapManager};
-use super::keys::{self, enc_start_key, enc_end_key};
+use super::keys::{self, enc_start_key, enc_end_key, data_end_key};
 use super::engine::{Iterable, Peekable, delete_all_in_range};
 use super::config::Config;
 use super::peer::{Peer, PendingCmd, ReadyResult, ExecResult, StaleState};
@@ -475,7 +475,11 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         self.register_raft_base_tick(event_loop);
     }
 
-    fn check_target_peer_valid(&mut self, region_id: u64, target: &metapb::Peer) -> Result<bool> {
+    fn check_target_peer_valid(&mut self,
+                               region_id: u64,
+                               target: &metapb::Peer,
+                               end_key: &[u8])
+                               -> Result<bool> {
         // we may encounter a message with larger peer id, which means
         // current peer is stale, then we should remove current peer
         let mut has_peer = false;
@@ -505,12 +509,25 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             has_peer = false;
         }
 
-        if !has_peer {
-            let peer = try!(Peer::replicate(self, region_id, target.get_id()));
-            // We don't have start_key of the region, so there is no need to insert into
-            // region_ranges
-            self.region_peers.insert(region_id, peer);
+        if has_peer {
+            return Ok(true);
         }
+
+        let encoded_end_key = data_end_key(end_key);
+        if let Some((_, &exist_region_id)) = self.region_ranges
+            .range(Included(&encoded_end_key), Unbounded::<&Key>)
+            .next() {
+            let exist_region = self.region_peers[&exist_region_id].region();
+            if enc_start_key(exist_region) < encoded_end_key {
+                warn!("target region {} is not created yet, skip.", region_id);
+                return Ok(false);
+            }
+        }
+
+        let peer = try!(Peer::replicate(self, region_id, target.get_id()));
+        // following snapshot may overlap, should insert into region_ranges after
+        // snapshot is applied.
+        self.region_peers.insert(region_id, peer);
         Ok(true)
     }
 
@@ -533,7 +550,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             return Ok(());
         }
 
-        if !try!(self.check_target_peer_valid(region_id, msg.get_to_peer())) {
+        if !try!(self.check_target_peer_valid(region_id, msg.get_to_peer(), msg.get_end_key())) {
             return Ok(());
         }
 
