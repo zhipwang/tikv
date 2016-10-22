@@ -46,6 +46,9 @@ const MAX_SNAP_TRY_CNT: usize = 5;
 pub const JOB_STATUS_PENDING: usize = 0;
 pub const JOB_STATUS_RUNNING: usize = 1;
 pub const JOB_STATUS_CANCEL: usize = 2;
+pub const JOB_STATUS_CANCELED: usize = 3;
+pub const JOB_STATUS_FINISHED: usize = 4;
+pub const JOB_STATUS_FAILED: usize = 5;
 
 pub type Ranges = Vec<(Vec<u8>, Vec<u8>)>;
 
@@ -628,14 +631,45 @@ impl PeerStorage {
         }
     }
 
+    #[inline]
+    pub fn try_finish_snap_state(&mut self) -> bool {
+        let new_state = match *self.snap_state.borrow() {
+            SnapState::Applying(ref status) => {
+                let s = status.load(Ordering::Relaxed);
+                if s == JOB_STATUS_FINISHED {
+                    SnapState::Relax
+                } else if s == JOB_STATUS_CANCELED {
+                    SnapState::ApplyAborted
+                } else if s == JOB_STATUS_FAILED {
+                    // TODO: cleanup region and treat it as tombstone.
+                    panic!("{} applying snapshot failed", self.tag);
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        };
+        *self.snap_state.borrow_mut() = new_state;
+        true
+    }
+
     /// Cancel applying snapshot, return true if the job can be considered actually cancelled.
     pub fn cancel_applying_snap(&mut self) -> bool {
         match *self.snap_state.borrow() {
             SnapState::Applying(ref status) => {
-                status.swap(JOB_STATUS_CANCEL, Ordering::Relaxed) == JOB_STATUS_PENDING
+                if status.compare_and_swap(JOB_STATUS_PENDING, JOB_STATUS_CANCEL,
+                                           Ordering::SeqCst) == JOB_STATUS_PENDING {
+                    return true;
+                } else if status.compare_and_swap(JOB_STATUS_RUNNING, JOB_STATUS_CANCEL,
+                                                  Ordering::SeqCst) == JOB_STATUS_RUNNING {
+                    return false;
+                }
             }
-            _ => false,
+            _ => return false,
         }
+        // now status can only be JOB_STATUS_CANCEL, JOB_STATUS_CANCELED,
+        // JOB_STATUS_FAILED and JOB_STATUS_FINISHED.
+        self.try_finish_snap_state()
     }
 
     #[inline]

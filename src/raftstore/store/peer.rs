@@ -459,17 +459,17 @@ impl Peer {
                                            trans: &T,
                                            metrics: &mut RaftMetrics)
                                            -> Result<Option<ReadyResult>> {
-        if !self.raft_group.has_ready() {
-            return Ok(None);
-        }
-
         let is_applying = self.get_store().is_applying_snap();
-        if is_applying {
+        if is_applying && !self.mut_store().try_finish_snap_state() {
             // If we continue handle all the messages, it may cause too many messages because
             // leader will send all the remaining messages to this follower, which can lead
             // to full message queue under high load.
             debug!("{} still applying snapshot, skip further handling.",
                    self.tag);
+            return Ok(None);
+        }
+
+        if !self.raft_group.has_ready() {
             return Ok(None);
         }
 
