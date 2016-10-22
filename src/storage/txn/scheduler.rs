@@ -202,6 +202,8 @@ pub struct Scheduler {
     // write concurrency control
     latches: Latches,
 
+    sched_too_busy_threshold: usize,
+
     // worker pool
     worker_pool: ThreadPool,
 }
@@ -211,7 +213,8 @@ impl Scheduler {
     pub fn new(engine: Box<Engine>,
                schedch: SendCh<Msg>,
                concurrency: usize,
-               worker_pool_size: usize)
+               worker_pool_size: usize,
+               sched_too_busy_threshold: usize)
                -> Scheduler {
         Scheduler {
             engine: engine,
@@ -219,6 +222,7 @@ impl Scheduler {
             schedch: schedch,
             id_alloc: 0,
             latches: Latches::new(concurrency),
+            sched_too_busy_threshold: sched_too_busy_threshold,
             worker_pool: ThreadPool::new_with_name(thd_name!("sched-worker-pool"),
                                                    worker_pool_size),
         }
@@ -262,7 +266,7 @@ fn process_read(cid: u64, mut cmd: Command, ch: SendCh<Msg>, snapshot: Box<Snaps
         // Scans a range starting with `start_key` up to `limit` rows from the snapshot.
         Command::Scan { ref start_key, limit, start_ts, .. } => {
             let snap_store = SnapshotStore::new(snapshot.as_ref(), start_ts);
-            let res = snap_store.scanner(ScanMode::Forward)
+            let res = snap_store.scanner(ScanMode::Forward, false)
                 .and_then(|mut scanner| scanner.scan(start_key.clone(), limit))
                 .and_then(|mut results| {
                     Ok(results.drain(..).map(|x| x.map_err(StorageError::from)).collect())
@@ -555,7 +559,7 @@ impl Scheduler {
     /// Note that once a command is ready to execute, the snapshot is always up-to-date during the
     /// execution because 1) all the conflicting commands (if any) must be in the waiting queues;
     /// 2) there may be non-conflicitng commands running concurrently, but it doesn't matter.
-    fn on_receive_new_cmd(&mut self, cmd: Command, callback: StorageCb) {
+    fn schedule_command(&mut self, cmd: Command, callback: StorageCb) {
         SCHED_STAGE_COUNTER_VEC.with_label_values(&[cmd.tag(), "new"]).inc();
         let cid = self.gen_id();
         debug!("received new command, cid={}, cmd={}", cid, cmd);
@@ -565,6 +569,20 @@ impl Scheduler {
 
         if self.acquire_lock(cid) {
             self.get_snapshot(cid);
+        }
+    }
+
+    fn too_busy(&self) -> bool {
+        self.cmd_ctxs.len() >= self.sched_too_busy_threshold
+    }
+
+    fn on_receive_new_cmd(&mut self, cmd: Command, callback: StorageCb) {
+        // write flow control
+        if !cmd.readonly() && self.too_busy() {
+            execute_callback(callback,
+                             ProcessResult::Failed { err: StorageError::SchedTooBusy });
+        } else {
+            self.schedule_command(cmd, callback);
         }
     }
 
@@ -592,6 +610,8 @@ impl Scheduler {
         };
 
         if let Err(e) = self.engine.async_snapshot(self.extract_context(cid), cb) {
+            SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "async_snap_err"])
+                .inc();
             self.finish_with_err(cid, Error::from(e));
         }
     }
@@ -601,11 +621,17 @@ impl Scheduler {
     /// Delivers the command along with the snapshot to a worker thread to execute.
     fn on_snapshot_finished(&mut self, cid: u64, snapshot: EngineResult<Box<Snapshot>>) {
         debug!("receive snapshot finish msg for cid={}", cid);
-        SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "snapshot_finish"])
-            .inc();
         match snapshot {
-            Ok(snapshot) => self.process_by_worker(cid, snapshot),
-            Err(e) => self.finish_with_err(cid, Error::from(e)),
+            Ok(snapshot) => {
+                SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "snapshot_ok"])
+                    .inc();
+                self.process_by_worker(cid, snapshot);
+            }
+            Err(e) => {
+                SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "snapshot_err"])
+                    .inc();
+                self.finish_with_err(cid, Error::from(e));
+            }
         }
     }
 
@@ -620,7 +646,7 @@ impl Scheduler {
         let cb = ctx.callback.take().unwrap();
         if let ProcessResult::NextCommand { cmd } = pr {
             SCHED_STAGE_COUNTER_VEC.with_label_values(&[ctx.tag, "next_cmd"]).inc();
-            self.on_receive_new_cmd(cmd, cb);
+            self.schedule_command(cmd, cb);
         } else {
             execute_callback(cb, pr);
         }
@@ -634,13 +660,9 @@ impl Scheduler {
     /// error to the callback, and releases the latches.
     fn on_write_prepare_failed(&mut self, cid: u64, e: Error) {
         debug!("write command(cid={}) failed at prewrite.", cid);
-
-        let mut ctx = self.remove_ctx(cid);
-        let cb = ctx.callback.take().unwrap();
-        let pr = ProcessResult::Failed { err: StorageError::from(e) };
-        execute_callback(cb, pr);
-
-        self.release_lock(&ctx.lock, cid);
+        SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "prepare_write_err"])
+            .inc();
+        self.finish_with_err(cid, e);
     }
 
     /// Event handler for the success of write prepare.
@@ -658,11 +680,9 @@ impl Scheduler {
         }
         let engine_cb = make_engine_cb(cid, pr, self.schedch.clone());
         if let Err(e) = self.engine.async_write(extract_ctx(&cmd), to_be_write, engine_cb) {
-            let mut ctx = self.remove_ctx(cid);
-            let cb = ctx.callback.take().unwrap();
-            execute_callback(cb, ProcessResult::Failed { err: StorageError::from(e) });
-
-            self.release_lock(&ctx.lock, cid);
+            SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "async_write_err"])
+                .inc();
+            self.finish_with_err(cid, Error::from(e));
         }
     }
 
@@ -678,7 +698,7 @@ impl Scheduler {
         };
         if let ProcessResult::NextCommand { cmd } = pr {
             SCHED_STAGE_COUNTER_VEC.with_label_values(&[ctx.tag, "next_cmd"]).inc();
-            self.on_receive_new_cmd(cmd, cb);
+            self.schedule_command(cmd, cb);
         } else {
             execute_callback(cb, pr);
         }
