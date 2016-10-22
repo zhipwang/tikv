@@ -12,12 +12,12 @@
 // limitations under the License.
 
 
-use std::fs;
+// use std::fs;
 use std::sync::{Arc, RwLock, Mutex};
 use std::sync::mpsc::{self, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tikv::pd::PdClient;
+// use tikv::pd::PdClient;
 use tikv::raftstore::Result;
 use tikv::util::HandyRwLock;
 use kvproto::eraftpb::{Message, MessageType};

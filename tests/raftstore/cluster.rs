@@ -579,9 +579,9 @@ impl<T: Simulator> Cluster<T> {
         }
     }
 
-    pub fn get_snap_dir(&self, node_id: u64) -> String {
-        self.sim.rl().get_snap_dir(node_id)
-    }
+    // pub fn get_snap_dir(&self, node_id: u64) -> String {
+    // self.sim.rl().get_snap_dir(node_id)
+    // }
 
     pub fn clear_send_filters(&mut self) {
         let mut sim = self.sim.wl();
@@ -628,6 +628,27 @@ impl<T: Simulator> Cluster<T> {
 
     pub fn must_split(&mut self, region: &metapb::Region, split_key: &[u8]) {
         self.must_batch_split(region, vec![split_key]);
+    }
+
+    pub fn must_check_peer(&mut self, region_id: u64, peer: metapb::Peer) {
+        let mut try_cnt = 0;
+        loop {
+            let find_leader = new_status_request(region_id, peer.clone(), new_region_leader_cmd());
+            let resp = self.call_command(find_leader, Duration::from_secs(5)).unwrap();
+
+            if !is_error_response(&resp) {
+                return;
+            }
+
+            if try_cnt > 250 {
+                panic!("peer {:?} has not been created after {} tries",
+                       peer,
+                       try_cnt);
+            }
+            try_cnt += 1;
+            sleep_ms(20);
+        }
+
     }
 
     // it's so common that we provide an API for it

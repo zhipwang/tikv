@@ -76,7 +76,7 @@ impl Runnable<Task> for Runner {
                escape(&task.end_key));
         CHECK_SPILT_COUNTER_VEC.with_label_values(&["all"]).inc();
 
-        let mut size = 0;
+        let mut split_region_size = 0;
         let mut total_size = 0;
         let mut split_keys = vec![];
         let timer = CHECK_SPILT_HISTOGRAM.start_timer();
@@ -84,16 +84,16 @@ impl Runnable<Task> for Runner {
         let res = task.engine.scan(&task.start_key,
                                    &task.end_key,
                                    &mut |k, v| {
-            size += k.len() as u64;
-            size += v.len() as u64;
-            if size > self.split_size {
+            total_size += k.len() as u64;
+            total_size += v.len() as u64;
+            if total_size - split_region_size > self.split_size {
                 split_keys.push(k.to_vec());
-                total_size += size;
-                size = 0;
+                // current kv belongs to next region, should not be counted
+                // into last_split_point.
+                split_region_size = total_size - k.len() as u64 - v.len() as u64;
             }
             Ok(true)
         });
-        total_size += size;
         if let Err(e) = res {
             error!("failed to scan split key of region {}: {:?}",
                    task.region_id,
@@ -106,7 +106,7 @@ impl Runnable<Task> for Runner {
         if total_size < self.region_max_size {
             debug!("[region {}] no need to send for {} < {}",
                    task.region_id,
-                   size,
+                   total_size,
                    self.region_max_size);
 
             CHECK_SPILT_COUNTER_VEC.with_label_values(&["ignore"]).inc();
