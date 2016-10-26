@@ -580,7 +580,7 @@ impl<T: Simulator> Cluster<T> {
     }
 
     // pub fn get_snap_dir(&self, node_id: u64) -> String {
-    // self.sim.rl().get_snap_dir(node_id)
+    //     self.sim.rl().get_snap_dir(node_id)
     // }
 
     pub fn clear_send_filters(&mut self) {
@@ -630,10 +630,12 @@ impl<T: Simulator> Cluster<T> {
         self.must_batch_split(region, vec![split_key]);
     }
 
-    pub fn must_check_peer(&mut self, region_id: u64, peer: metapb::Peer) {
+    /// Make sure region exists on that store.
+    pub fn must_region_exist(&mut self, region_id: u64, store_id: u64) {
         let mut try_cnt = 0;
         loop {
-            let find_leader = new_status_request(region_id, peer.clone(), new_region_leader_cmd());
+            let find_leader =
+                new_status_request(region_id, new_peer(store_id, 0), new_region_leader_cmd());
             let resp = self.call_command(find_leader, Duration::from_secs(5)).unwrap();
 
             if !is_error_response(&resp) {
@@ -641,8 +643,9 @@ impl<T: Simulator> Cluster<T> {
             }
 
             if try_cnt > 250 {
-                panic!("peer {:?} has not been created after {} tries",
-                       peer,
+                panic!("region {} doesn't exist on store {} after {} tries",
+                       region_id,
+                       store_id,
                        try_cnt);
             }
             try_cnt += 1;
