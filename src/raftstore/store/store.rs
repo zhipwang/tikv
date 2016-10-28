@@ -854,12 +854,14 @@ impl<T: Transport, C: PdClient> Store<T, C> {
     }
 
     fn on_ready_compact_log(&mut self, region_id: u64, state: RaftTruncatedState) {
-        let peer = self.region_peers.get(&region_id).unwrap();
+        let mut peer = self.region_peers.get_mut(&region_id).unwrap();
         let task = CompactTask::CompactRaftLog {
             engine: peer.get_store().get_engine().clone(),
             region_id: peer.get_store().get_region_id(),
+            start_idx: peer.last_compacted_idx,
             compact_idx: state.get_index() + 1,
         };
+        peer.last_compacted_idx = state.get_index() + 1;
         if let Err(e) = self.compact_worker.schedule(task) {
             error!("[region {}] failed to schedule compact task: {}",
                    region_id,
@@ -989,7 +991,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         Ok(())
     }
 
-    fn propose_raft_command(&mut self, msg: RaftCmdRequest, cb: Callback) -> Result<()> {
+    fn propose_raft_command(&mut self, msg: RaftCmdRequest, cb: Callback) {
         let mut resp = RaftCmdResponse::new();
         let uuid: Uuid = match util::get_uuid_from_req(&msg) {
             None => {
@@ -1035,16 +1037,14 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let pending_cmd = PendingCmd {
             uuid: uuid,
             term: term,
-            cb: cb,
+            cb: Some(cb),
         };
-        try!(peer.propose(pending_cmd, msg, resp));
-
-        self.pending_raft_groups.insert(region_id);
+        if peer.propose(pending_cmd, msg, resp) {
+            self.pending_raft_groups.insert(region_id);
+        }
 
         // TODO: add timeout, if the command is not applied after timeout,
         // we will call the callback with timeout error.
-
-        Ok(())
     }
 
     fn validate_region(&self, msg: &RaftCmdRequest) -> Result<()> {
@@ -1130,11 +1130,9 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             // Create a compact log request and notify directly.
             let request = new_compact_log_request(region_id, peer.peer.clone(), compact_idx);
 
-            let cb = Box::new(move |_: RaftCmdResponse| -> Result<()> { Ok(()) });
-
             if let Err(e) = self.sendch.try_send(Msg::RaftCmd {
                 request: request,
-                callback: cb,
+                callback: Box::new(|_| {}),
             }) {
                 error!("{} send compact log {} err {:?}", peer.tag, compact_idx, e);
             }
@@ -1542,11 +1540,7 @@ impl<T: Transport, C: PdClient> mio::Handler for Store<T, C> {
                     error!("handle raft message err: {:?}", e);
                 }
             }
-            Msg::RaftCmd { request, callback } => {
-                if let Err(e) = self.propose_raft_command(request, callback) {
-                    error!("propose raft command err: {:?}", e);
-                }
-            }
+            Msg::RaftCmd { request, callback } => self.propose_raft_command(request, callback),
             Msg::Quit => {
                 info!("receive quit message");
                 event_loop.shutdown();
@@ -1594,6 +1588,9 @@ impl<T: Transport, C: PdClient> mio::Handler for Store<T, C> {
                 if let Some(Err(e)) = handle.map(|h| h.join()) {
                     error!("failed to stop {}: {:?}", name, e);
                 }
+            }
+            for peer in self.region_peers.values_mut() {
+                peer.clear_pending_commands();
             }
 
             return;

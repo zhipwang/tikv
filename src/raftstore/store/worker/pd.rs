@@ -19,8 +19,7 @@ use protobuf::RepeatedField;
 
 use kvproto::metapb;
 use kvproto::eraftpb::ConfChangeType;
-use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, AdminRequest, AdminCmdType,
-                          SplitRequest};
+use kvproto::raft_cmdpb::{RaftCmdRequest, AdminRequest, AdminCmdType, SplitRequest};
 use kvproto::raft_serverpb::RaftMessage;
 use kvproto::pdpb;
 
@@ -28,7 +27,6 @@ use util::worker::Runnable;
 use util::transport::SendCh;
 use pd::PdClient;
 use raftstore::store::Msg;
-use raftstore::Result;
 use raftstore::store::util::is_epoch_stale;
 
 use super::metrics::*;
@@ -111,11 +109,9 @@ impl<T: PdClient> Runner<T> {
 
         req.set_admin_request(request);
 
-        let cb = Box::new(move |_: RaftCmdResponse| -> Result<()> { Ok(()) });
-
         if let Err(e) = self.ch.try_send(Msg::RaftCmd {
             request: req,
-            callback: cb,
+            callback: Box::new(|_| {}),
         }) {
             error!("[region {}] send {:?} request err {:?}",
                    region_id,
