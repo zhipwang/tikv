@@ -12,12 +12,11 @@
 // limitations under the License.
 
 
-// use std::fs;
+use std::fs;
 use std::sync::{Arc, RwLock, Mutex};
 use std::sync::mpsc::{self, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// use tikv::pd::PdClient;
 use tikv::raftstore::Result;
 use tikv::util::HandyRwLock;
 use kvproto::eraftpb::{Message, MessageType};
@@ -99,7 +98,86 @@ fn test_server_huge_snapshot() {
     test_huge_snapshot(&mut cluster);
 }
 
-// TODO: test snap gc.
+fn test_snap_gc<T: Simulator>(cluster: &mut Cluster<T>) {
+    // truncate the log quickly so that we can force sending snapshot.
+    cluster.cfg.raft_store.raft_log_gc_tick_interval = 20;
+    cluster.cfg.raft_store.raft_log_gc_limit = 2;
+    cluster.cfg.raft_store.snap_mgr_gc_tick_interval = 50;
+    cluster.cfg.raft_store.snap_gc_timeout = 2;
+
+    let pd_client = cluster.pd_client.clone();
+    // Disable default max peer count check.
+    pd_client.disable_default_rule();
+    let r1 = cluster.run_conf_change();
+    cluster.must_put(b"k1", b"v1");
+    pd_client.must_add_peer(r1, new_peer(2, 2));
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+    // drop all the snapshot so we can detect stale snapfile.
+    cluster.sim.wl().add_recv_filter(3, box DropSnapshotFilter);
+    pd_client.must_add_peer(r1, new_peer(3, 3));
+
+    cluster.must_put(b"k2", b"v2");
+
+    // node 1 and node 2 must have k2, but node 3 must not.
+    for i in 1..3 {
+        let engine = cluster.get_engine(i);
+        must_get_equal(&engine, b"k2", b"v2");
+    }
+
+    let engine3 = cluster.get_engine(3);
+    must_get_none(&engine3, b"k2");
+
+    for _ in 0..30 {
+        // write many logs to force log GC for region 1 and region 2.
+        // and trigger snapshot more than one time.
+        cluster.must_put(b"k1", b"v1");
+        cluster.must_put(b"k2", b"v2");
+    }
+
+    let snap_dir = cluster.get_snap_dir(3);
+    // it must have more than 2 snaps.
+    let snapfiles: Vec<_> = fs::read_dir(snap_dir).unwrap().map(|p| p.unwrap().path()).collect();
+    assert!(snapfiles.len() > 2);
+
+    cluster.sim.wl().clear_recv_filters(3);
+    debug!("filters cleared.");
+
+    // node 3 must have k1, k2.
+    must_get_equal(&engine3, b"k1", b"v1");
+    must_get_equal(&engine3, b"k2", b"v2");
+
+    let mut tried_cnt = 0;
+    loop {
+        let mut snap_files = vec![];
+        for i in 1..4 {
+            let snap_dir = cluster.get_snap_dir(i);
+            // snapfiles should be gc.
+            snap_files.extend(fs::read_dir(snap_dir).unwrap().map(|p| p.unwrap().path()));
+        }
+        if snap_files.is_empty() {
+            return;
+        }
+        if tried_cnt > 200 {
+            panic!("snap files is still not empty: {:?}", snap_files);
+        }
+        tried_cnt += 1;
+        // trigger log compaction.
+        cluster.must_put(b"k2", b"v2");
+        sleep_ms(20);
+    }
+}
+
+#[test]
+fn test_node_snap_gc() {
+    let mut cluster = new_node_cluster(0, 3);
+    test_snap_gc(&mut cluster);
+}
+
+#[test]
+fn test_server_snap_gc() {
+    let mut cluster = new_server_cluster(0, 3);
+    test_snap_gc(&mut cluster);
+}
 
 fn test_concurrent_snap<T: Simulator>(cluster: &mut Cluster<T>) {
     // util::init_log();

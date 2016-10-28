@@ -579,9 +579,9 @@ impl<T: Simulator> Cluster<T> {
         }
     }
 
-    // pub fn get_snap_dir(&self, node_id: u64) -> String {
-    //     self.sim.rl().get_snap_dir(node_id)
-    // }
+    pub fn get_snap_dir(&self, node_id: u64) -> String {
+        self.sim.rl().get_snap_dir(node_id)
+    }
 
     pub fn clear_send_filters(&mut self) {
         let mut sim = self.sim.wl();
