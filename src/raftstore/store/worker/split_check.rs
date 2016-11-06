@@ -83,6 +83,7 @@ impl Runnable<Task> for Runner {
 
         let res = task.engine.scan(&task.start_key,
                                    &task.end_key,
+                                   false,
                                    &mut |k, v| {
             total_size += k.len() as u64;
             total_size += v.len() as u64;

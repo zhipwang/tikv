@@ -25,7 +25,7 @@ pub mod engine;
 pub mod mvcc;
 pub mod txn;
 pub mod config;
-mod types;
+pub mod types;
 mod metrics;
 
 pub use self::config::Config;
@@ -86,6 +86,7 @@ pub enum Command {
         ctx: Context,
         start_key: Key,
         limit: usize,
+        key_only: bool,
         start_ts: u64,
     },
     Prewrite {
@@ -357,6 +358,7 @@ impl Storage {
                       ctx: Context,
                       start_key: Key,
                       limit: usize,
+                      key_only: bool,
                       start_ts: u64,
                       callback: Callback<Vec<Result<KvPair>>>)
                       -> Result<()> {
@@ -364,6 +366,7 @@ impl Storage {
             ctx: ctx,
             start_key: start_key,
             limit: limit,
+            key_only: key_only,
             start_ts: start_ts,
         };
         let tag = cmd.tag();
@@ -703,6 +706,7 @@ mod tests {
         storage.async_scan(Context::new(),
                         make_key(b"\x00"),
                         1000,
+                        false,
                         5,
                         expect_scan(tx.clone(),
                                     vec![
@@ -827,6 +831,31 @@ mod tests {
                             b"x".to_vec(),
                             100,
                             expect_too_busy(tx.clone()))
+            .unwrap();
+        rx.recv().unwrap();
+        storage.stop().unwrap();
+    }
+
+    #[test]
+    fn test_cleanup() {
+        let config = Config::new();
+        let mut storage = Storage::new(&config).unwrap();
+        storage.start(&config).unwrap();
+        let (tx, rx) = channel();
+        storage.async_prewrite(Context::new(),
+                            vec![Mutation::Put((make_key(b"x"), b"100".to_vec()))],
+                            b"x".to_vec(),
+                            100,
+                            expect_ok(tx.clone()))
+            .unwrap();
+        rx.recv().unwrap();
+        storage.async_cleanup(Context::new(), make_key(b"x"), 100, expect_ok(tx.clone()))
+            .unwrap();
+        rx.recv().unwrap();
+        storage.async_get(Context::new(),
+                       make_key(b"x"),
+                       105,
+                       expect_get_none(tx.clone()))
             .unwrap();
         rx.recv().unwrap();
         storage.stop().unwrap();

@@ -25,6 +25,7 @@ use rocksdb::DB;
 use mio::{self, EventLoop, EventLoopBuilder, Sender};
 use protobuf;
 use uuid::Uuid;
+use time::{self, Timespec};
 
 use kvproto::raft_serverpb::{RaftMessage, RaftSnapshotData, RaftTruncatedState, RegionLocalState,
                              PeerState};
@@ -44,7 +45,7 @@ use util::get_disk_stat;
 use util::rocksdb;
 use storage::{ALL_CFS, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use super::worker::{SplitCheckRunner, SplitCheckTask, RegionTask, RegionRunner, CompactTask,
-                    CompactRunner, PdRunner, PdTask};
+                    CompactRunner, RaftlogGcTask, RaftlogGcRunner, PdRunner, PdTask};
 use super::{util, Msg, Tick, SnapManager};
 use super::keys::{self, enc_start_key, enc_end_key, data_end_key, data_key};
 use super::engine::{Iterable, Peekable, delete_all_in_range};
@@ -202,6 +203,7 @@ pub struct Store<T: Transport, C: PdClient + 'static> {
     pending_regions: Vec<metapb::Region>,
     split_check_worker: Worker<SplitCheckTask>,
     region_worker: Worker<RegionTask>,
+    raftlog_gc_worker: Worker<RaftlogGcTask>,
     compact_worker: Worker<CompactTask>,
     pd_worker: Worker<PdTask>,
 
@@ -213,6 +215,10 @@ pub struct Store<T: Transport, C: PdClient + 'static> {
     snap_mgr: SnapManager,
 
     raft_metrics: RaftMetrics,
+
+    tag: String,
+
+    start_time: Timespec,
 }
 
 pub fn create_event_loop<T, C>(cfg: &Config) -> Result<EventLoop<Store<T, C>>>
@@ -242,6 +248,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
         let sendch = SendCh::new(sender, "raftstore");
         let peer_cache = HashMap::new();
+        let tag = format!("[store {}]", meta.get_id());
 
         let mut s = Store {
             cfg: cfg,
@@ -252,6 +259,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             pending_raft_groups: HashSet::new(),
             split_check_worker: Worker::new("split check worker"),
             region_worker: Worker::new("snapshot worker"),
+            raftlog_gc_worker: Worker::new("raft gc worker"),
             compact_worker: Worker::new("compact worker"),
             pd_worker: Worker::new("pd worker"),
             region_ranges: BTreeMap::new(),
@@ -261,6 +269,8 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             peer_cache: Rc::new(RefCell::new(peer_cache)),
             snap_mgr: mgr,
             raft_metrics: RaftMetrics::default(),
+            tag: tag,
+            start_time: time::get_time(),
         };
         try!(s.init());
         Ok(s)
@@ -281,6 +291,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let t = Instant::now();
         try!(engine.scan(start_key,
                          end_key,
+                         false,
                          &mut |key, value| {
             let (region_id, suffix) = try!(keys::decode_region_meta_key(key));
             if suffix != keys::REGION_STATE_SUFFIX {
@@ -315,9 +326,9 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             Ok(true)
         }));
 
-        info!("[store {}] starts with {} regions, including {} tombstones and {} applying \
+        info!("{} starts with {} regions, including {} tombstones and {} applying \
                regions, takes {:?}",
-              self.store_id(),
+              self.tag,
               total_count,
               tomebstone_count,
               applying_count,
@@ -341,8 +352,8 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
         try!(delete_all_in_range(&self.engine, &last_start_key, keys::DATA_MAX_KEY));
 
-        info!("[store {}] cleans up garbage data, takes {:?}",
-              self.store_id(),
+        info!("{} cleans up garbage data, takes {:?}",
+              self.tag,
               t.elapsed());
         Ok(())
     }
@@ -369,6 +380,9 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                                        self.snap_mgr.clone(),
                                        self.cfg.snap_apply_batch_size);
         box_try!(self.region_worker.start(runner));
+
+        let raftlog_gc_runner = RaftlogGcRunner;
+        box_try!(self.raftlog_gc_worker.start(raftlog_gc_runner));
 
         let compact_runner = CompactRunner::new(self.engine.clone());
         box_try!(self.compact_worker.start(compact_runner));
@@ -413,7 +427,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         // If we register raft base tick failed, the whole raft can't run correctly,
         // TODO: shutdown the store?
         if let Err(e) = register_timer(event_loop, Tick::Raft, self.cfg.raft_base_tick_interval) {
-            error!("register raft base tick err: {:?}", e);
+            error!("{} register raft base tick err: {:?}", self.tag, e);
         };
     }
 
@@ -485,7 +499,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             let target_peer_id = target.get_id();
             if p.peer_id() < target_peer_id {
                 if p.is_applying() && !p.mut_store().cancel_applying_snap() {
-                    warn!("[region {}] Stale peer {} is applying snapshot, will destroy next \
+                    info!("[region {}] Stale peer {} is applying snapshot, will destroy next \
                            time.",
                           region_id,
                           p.peer_id());
@@ -493,7 +507,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 }
                 stale_peer = Some(p.peer.clone());
             } else if p.peer_id() > target_peer_id {
-                warn!("target peer id {} is less than {}, msg maybe stale.",
+                info!("target peer id {} is less than {}, msg maybe stale.",
                       target_peer_id,
                       p.peer_id());
                 return Ok(false);
@@ -513,7 +527,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let msg_type = message.get_msg_type();
         if msg_type != MessageType::MsgRequestVote &&
            (msg_type != MessageType::MsgHeartbeat || message.get_commit() != INVALID_INDEX) {
-            warn!("target peer {:?} doesn't exist, stale message {:?}.",
+            info!("target peer {:?} doesn't exist, stale message {:?}.",
                   target,
                   msg_type);
             return Ok(false);
@@ -650,29 +664,28 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         // no exist, check with tombstone key.
         let state_key = keys::region_state_key(region_id);
         if let Some(local_state) = try!(self.engine.get_msg::<RegionLocalState>(&state_key)) {
-            if local_state.get_state() == PeerState::Tombstone {
-                let region = local_state.get_region();
-                let region_epoch = region.get_region_epoch();
-                // The region in this peer is already destroyed
-                if util::is_epoch_stale(from_epoch, region_epoch) {
-                    info!("[region {}] tombstone peer [epoch: {:?}] \
-                        receive a stale message {:?}", region_id,
-                        region_epoch,
-                          msg,
-                          );
+            assert_eq!(local_state.get_state(), PeerState::Tombstone);
+            let region = local_state.get_region();
+            let region_epoch = region.get_region_epoch();
+            // The region in this peer is already destroyed
+            if util::is_epoch_stale(from_epoch, region_epoch) {
+                info!("[region {}] tombstone peer [epoch: {:?}] \
+                    receive a stale message {:?}", region_id,
+                    region_epoch,
+                        msg,
+                        );
 
-                    let not_exist = util::find_peer(region, from_store_id).is_none();
-                    self.handle_stale_msg(msg, region_epoch, is_vote_msg && not_exist);
+                let not_exist = util::find_peer(region, from_store_id).is_none();
+                self.handle_stale_msg(msg, region_epoch, is_vote_msg && not_exist);
 
-                    return Ok(true);
-                }
+                return Ok(true);
+            }
 
-                if from_epoch.get_conf_ver() == region_epoch.get_conf_ver() {
-                    return Err(box_err!("tombstone peer [epoch: {:?}] receive an invalid \
-                                         message {:?}, ignore it",
-                                        region_epoch,
-                                        msg));
-                }
+            if from_epoch.get_conf_ver() == region_epoch.get_conf_ver() {
+                return Err(box_err!("tombstone peer [epoch: {:?}] receive an invalid \
+                                        message {:?}, ignore it",
+                                    region_epoch,
+                                    msg));
             }
         }
 
@@ -685,14 +698,14 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let to_peer = msg.get_to_peer();
 
         if !need_gc {
-            warn!("[region {}] raft message {:?} is stale, current {:?}, ignore it",
+            info!("[region {}] raft message {:?} is stale, current {:?}, ignore it",
                   region_id,
                   msg,
                   cur_epoch);
             return;
         }
 
-        warn!("[region {}] raft message {:?} is stale, current {:?}, tell to gc",
+        info!("[region {}] raft message {:?} is stale, current {:?}, tell to gc",
               region_id,
               msg,
               cur_epoch);
@@ -717,7 +730,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             let from_epoch = msg.get_region_epoch();
             if util::is_epoch_stale(peer.get_store().region.get_region_epoch(), from_epoch) {
                 // TODO: ask pd to guarantee we are stale now.
-                warn!("[region {}] peer {:?} receives gc message, remove",
+                info!("[region {}] peer {:?} receives gc message, remove",
                       region_id,
                       msg.get_to_peer());
                 need_remove = true;
@@ -744,7 +757,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let snap_region = snap_data.take_region();
         let peer_id = msg.get_to_peer().get_id();
         if snap_region.get_peers().into_iter().all(|p| p.get_id() != peer_id) {
-            warn!("region {:?} doesn't contain peer {:?}, skip.",
+            info!("region {:?} doesn't contain peer {:?}, skip.",
                   snap_region,
                   msg.get_to_peer());
             return Ok(false);
@@ -754,7 +767,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             .next() {
             let exist_region = self.region_peers[&exist_region_id].region();
             if enc_start_key(exist_region) < enc_end_key(&snap_region) {
-                warn!("region overlapped {:?}, {:?}", exist_region, snap_region);
+                info!("region overlapped {:?}, {:?}", exist_region, snap_region);
                 return Ok(false);
             }
         }
@@ -763,7 +776,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                enc_end_key(region) > enc_start_key(&snap_region) &&
                // Same region can overlap, we will apply the latest version of snapshot.
                region.get_id() != snap_region.get_id() {
-                warn!("pending region overlapped {:?}, {:?}", region, snap_region);
+                info!("pending region overlapped {:?}, {:?}", region, snap_region);
                 return Ok(false);
             }
         }
@@ -807,13 +820,13 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         PEER_RAFT_PROCESS_NANOS_COUNTER_VEC.with_label_values(&["ready"])
             .inc_by(duration_to_nanos(t.elapsed()) as f64)
             .unwrap();
-        slow_log!(t, "on {} regions raft ready", pending_count);
+        slow_log!(t, "{} on {} regions raft ready", self.tag, pending_count);
 
         Ok(())
     }
 
     fn destroy_peer(&mut self, region_id: u64, peer: metapb::Peer) {
-        warn!("[region {}] destroy peer {:?}", region_id, peer);
+        info!("[region {}] destroy peer {:?}", region_id, peer);
         // TODO: should we check None here?
         // Can we destroy it in another thread later?
         let mut p = self.region_peers.remove(&region_id).unwrap();
@@ -822,13 +835,15 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
         let is_initialized = p.is_initialized();
         if let Err(e) = p.destroy() {
-            // should panic here?
-            error!("[region {}] destroy peer {:?} in store {} err {:?}",
+            // If not panic here, the peer will be recreated in the next restart,
+            // then it will be gc again. But if some overlap region is created
+            // before restarting, the gc action will delete the overlap region's
+            // data too.
+            panic!("[region {}] destroy peer {:?} in store {} err {:?}",
                    region_id,
                    peer,
                    self.store_id(),
                    e);
-            return;
         }
 
         if is_initialized && self.region_ranges.remove(&enc_end_key(p.region())).is_none() {
@@ -868,14 +883,14 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
     fn on_ready_compact_log(&mut self, region_id: u64, state: RaftTruncatedState) {
         let mut peer = self.region_peers.get_mut(&region_id).unwrap();
-        let task = CompactTask::CompactRaftLog {
+        let task = RaftlogGcTask {
             engine: peer.get_store().get_engine().clone(),
             region_id: peer.get_store().get_region_id(),
             start_idx: peer.last_compacted_idx,
-            compact_idx: state.get_index() + 1,
+            end_idx: state.get_index() + 1,
         };
         peer.last_compacted_idx = state.get_index() + 1;
-        if let Err(e) = self.compact_worker.schedule(task) {
+        if let Err(e) = self.raftlog_gc_worker.schedule(task) {
             error!("[region {}] failed to schedule compact task: {}",
                    region_id,
                    e);
@@ -947,7 +962,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 right: region[1].clone(),
             };
             if let Err(e) = self.pd_worker.schedule(task) {
-                error!("failed to notify pd: {}", e);
+                error!("{} failed to notify pd: {}", self.tag, e);
             }
         }
     }
@@ -1099,7 +1114,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             // If failed, we can't cleanup the raft log regularly.
             // Although the log size will grow larger and larger, it doesn't affect
             // whole raft logic, and we can send truncate log command to compact it.
-            error!("register raft gc log tick err: {:?}", e);
+            error!("{} register raft gc log tick err: {:?}", self.tag, e);
         };
     }
 
@@ -1158,7 +1173,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         if let Err(e) = register_timer(event_loop,
                                        Tick::SplitRegionCheck,
                                        self.cfg.split_region_check_tick_interval) {
-            error!("register split region check tick err: {:?}", e);
+            error!("{} register split region check tick err: {:?}", self.tag, e);
         };
     }
 
@@ -1184,7 +1199,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                   self.cfg.region_check_size_diff);
             let task = SplitCheckTask::new(peer.get_store());
             if let Err(e) = self.split_check_worker.schedule(task) {
-                error!("failed to schedule split check: {}", e);
+                error!("{} failed to schedule split check: {}", self.tag, e);
             }
             peer.size_diff_hint = 0;
         }
@@ -1196,7 +1211,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         if let Err(e) = register_timer(event_loop,
                                        Tick::CompactCheck,
                                        self.cfg.region_compact_check_tick_interval) {
-            error!("register compact check tick err: {:?}", e);
+            error!("{} register compact check tick err: {:?}", self.tag, e);
         };
     }
 
@@ -1206,13 +1221,13 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 continue;
             }
             for &cf in &[CF_DEFAULT, CF_WRITE] {
-                let task = CompactTask::CompactRangeCF {
+                let task = CompactTask {
                     cf_name: String::from(cf),
                     start_key: Some(keys::enc_start_key(peer.region())),
                     end_key: Some(keys::enc_end_key(peer.region())),
                 };
                 if let Err(e) = self.compact_worker.schedule(task) {
-                    error!("failed to schedule compact task: {}", e);
+                    error!("{} failed to schedule compact task: {}", self.tag, e);
                 }
             }
             peer.delete_keys_hint = 0;
@@ -1297,7 +1312,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         if let Err(e) = register_timer(event_loop,
                                        Tick::PdHeartbeat,
                                        self.cfg.pd_heartbeat_tick_interval) {
-            error!("register pd heartbeat tick err: {:?}", e);
+            error!("{} register pd heartbeat tick err: {:?}", self.tag, e);
         };
     }
 
@@ -1306,7 +1321,9 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let disk_stat = match get_disk_stat(self.engine.path()) {
             Ok(disk_stat) => disk_stat,
             Err(_) => {
-                error!("get disk stat for rocksdb {} failed", self.engine.path());
+                error!("{} get disk stat for rocksdb {} failed",
+                       self.tag,
+                       self.engine.path());
                 return;
             }
         };
@@ -1323,13 +1340,19 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 .get_property_int_cf(handle, ROCKSDB_TOTAL_SST_FILE_SIZE_PROPERTY)
                 .expect("rocksdb is too old, missing total-sst-files-size property");
 
+            // It is important to monitor each cf's size, especially the "raft" and "lock" column
+            // families.
+            STORE_ENGINE_SIZE_GAUGE_VEC.with_label_values(&[cf]).set(cf_used_size as f64);
+
             used_size += cf_used_size;
         }
+
+        used_size += self.snap_mgr.rl().get_total_snap_size();
 
         let mut available = if capacity > used_size {
             capacity - used_size
         } else {
-            warn!("no available space for store {}", self.store_id());
+            warn!("{} no available space", self.tag);
             0
         };
 
@@ -1355,8 +1378,10 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         STORE_SNAPSHOT_TRAFFIC_GAUGE_VEC.with_label_values(&["receiving"])
             .set(snap_stats.receiving_count as f64);
 
+        stats.set_start_time(self.start_time.sec as u32);
+
         if let Err(e) = self.pd_worker.schedule(PdTask::StoreHeartbeat { stats: stats }) {
-            error!("failed to notify pd: {}", e);
+            error!("{} failed to notify pd: {}", self.tag, e);
         }
     }
 
@@ -1420,20 +1445,22 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
     fn on_snap_mgr_gc(&mut self, event_loop: &mut EventLoop<Self>) {
         if let Err(e) = self.handle_snap_mgr_gc() {
-            error!("failed to gc snap manager on {}: {:?}", self.store_id(), e);
+            error!("{} failed to gc snap manager: {:?}", self.tag, e);
         }
         self.register_snap_mgr_gc_tick(event_loop);
     }
 
     fn on_compact_lock_cf(&mut self, event_loop: &mut EventLoop<Self>) {
         // Create a compact lock cf task(compact whole range) and schedule directly.
-        let task = CompactTask::CompactRangeCF {
+        let task = CompactTask {
             cf_name: String::from(CF_LOCK),
             start_key: None,
             end_key: None,
         };
         if let Err(e) = self.compact_worker.schedule(task) {
-            error!("failed to schedule compact lock cf task: {}", e);
+            error!("{} failed to schedule compact lock cf task: {:?}",
+                   self.tag,
+                   e);
         }
 
         self.register_compact_lock_cf_tick(event_loop);
@@ -1443,7 +1470,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         if let Err(e) = register_timer(event_loop,
                                        Tick::PdStoreHeartbeat,
                                        self.cfg.pd_store_heartbeat_tick_interval) {
-            error!("register pd store heartbeat tick err: {:?}", e);
+            error!("{} register pd store heartbeat tick err: {:?}", self.tag, e);
         };
     }
 
@@ -1451,7 +1478,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         if let Err(e) = register_timer(event_loop,
                                        Tick::SnapGc,
                                        self.cfg.snap_mgr_gc_tick_interval) {
-            error!("register snap mgr gc tick err: {:?}", e);
+            error!("{} register snap mgr gc tick err: {:?}", self.tag, e);
         }
     }
 
@@ -1459,7 +1486,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         if let Err(e) = register_timer(event_loop,
                                        Tick::CompactLockCf,
                                        self.cfg.lock_cf_compact_interval_secs * 1000) {
-            error!("register compact cf-lock tick err: {:?}", e);
+            error!("{} register compact cf-lock tick err: {:?}", self.tag, e);
         }
     }
 
@@ -1550,12 +1577,12 @@ impl<T: Transport, C: PdClient> mio::Handler for Store<T, C> {
         match msg {
             Msg::RaftMessage(data) => {
                 if let Err(e) = self.on_raft_message(data) {
-                    error!("handle raft message err: {:?}", e);
+                    error!("{} handle raft message err: {:?}", self.tag, e);
                 }
             }
             Msg::RaftCmd { request, callback } => self.propose_raft_command(request, callback),
             Msg::Quit => {
-                info!("receive quit message");
+                info!("{} receive quit message", self.tag);
                 event_loop.shutdown();
             }
             Msg::SplitCheckResult { region_id, epoch, split_keys } => {
@@ -1573,7 +1600,7 @@ impl<T: Transport, C: PdClient> mio::Handler for Store<T, C> {
                 self.on_snap_gen_res(region_id, snap);
             }
         }
-        slow_log!(t, "handle {:?}", msg_str);
+        slow_log!(t, "{} handle {}", self.tag, msg_str);
     }
 
     fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Tick) {
@@ -1588,7 +1615,7 @@ impl<T: Transport, C: PdClient> mio::Handler for Store<T, C> {
             Tick::SnapGc => self.on_snap_mgr_gc(event_loop),
             Tick::CompactLockCf => self.on_compact_lock_cf(event_loop),
         }
-        slow_log!(t, "handle timeout {:?}", timeout);
+        slow_log!(t, "{} handle timeout {:?}", self.tag, timeout);
     }
 
     fn tick(&mut self, event_loop: &mut EventLoop<Self>) {
@@ -1596,10 +1623,12 @@ impl<T: Transport, C: PdClient> mio::Handler for Store<T, C> {
             for (handle, name) in vec![(self.split_check_worker.stop(),
                                         self.split_check_worker.name()),
                                        (self.region_worker.stop(), self.region_worker.name()),
+                                       (self.raftlog_gc_worker.stop(),
+                                        self.raftlog_gc_worker.name()),
                                        (self.compact_worker.stop(), self.compact_worker.name()),
                                        (self.pd_worker.stop(), self.pd_worker.name())] {
                 if let Some(Err(e)) = handle.map(|h| h.join()) {
-                    error!("failed to stop {}: {:?}", name, e);
+                    error!("{} failed to stop {}: {:?}", self.tag, name, e);
                 }
             }
             for peer in self.region_peers.values_mut() {
@@ -1612,7 +1641,7 @@ impl<T: Transport, C: PdClient> mio::Handler for Store<T, C> {
         // We handle raft ready in event loop.
         if let Err(e) = self.on_raft_ready() {
             // TODO: should we panic here or shutdown the store?
-            error!("handle raft ready err: {:?}", e);
+            error!("{} handle raft ready err: {:?}", self.tag, e);
         }
         self.pending_regions.clear();
     }
