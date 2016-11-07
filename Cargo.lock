@@ -261,7 +261,7 @@ dependencies = [
 [[package]]
 name = "kvproto"
 version = "0.0.1"
-source = "git+https://github.com/pingcap/kvproto?branch=busyjay/conditional-replica#d6c14ce6f5b42a5560937826664fd8d3ea854fc8"
+source = "git+https://github.com/pingcap/kvproto?branch=busyjay/conditional-replica#ed25628774e680135525e4266e111edd58872b09"
 dependencies = [
  "protobuf 1.0.23 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
