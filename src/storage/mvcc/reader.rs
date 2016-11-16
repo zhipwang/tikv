@@ -12,10 +12,10 @@
 // limitations under the License.
 
 use storage::engine::{Snapshot, Cursor, ScanMode};
-use storage::{Key, Value, CF_LOCK, CF_WRITE};
+use storage::{Key, Value, CF_LOCK, CF_WRITE, CF_KEY};
 use super::{Error, Result};
 use super::lock::Lock;
-use super::write::{Write, WriteType};
+use super::write::{Write, WriteType, LatestWrite};
 
 pub struct MvccReader<'a> {
     snapshot: &'a Snapshot,
@@ -89,6 +89,13 @@ impl<'a> MvccReader<'a> {
         }
     }
 
+    pub fn load_latest_write(&mut self, key: &Key) -> Result<Option<LatestWrite>> {
+        match try!(self.snapshot.get_cf(CF_KEY, &key)) {
+            Some(k) => Ok(Some(try!(LatestWrite::parse(&k)))),
+            None => Ok(None),
+        }
+    }
+
     fn get_scan_mode(&self, allow_backward: bool) -> ScanMode {
         match self.scan_mode {
             Some(ScanMode::Forward) => ScanMode::Forward,
@@ -153,6 +160,17 @@ impl<'a> MvccReader<'a> {
                     ttl: lock.ttl,
                 });
             }
+        }
+        if let Some(latest_write) = try!(self.load_latest_write(key)) {
+            if ts >= latest_write.commit_ts {
+                match latest_write.write_type {
+                    WriteType::Put => return self.load_data(key, latest_write.start_ts).map(Some),
+                    WriteType::Delete => return Ok(None),
+                    _ => {}
+                }
+            }
+        } else {
+            return Ok(None);
         }
         loop {
             match try!(self.seek_write(key, ts)) {

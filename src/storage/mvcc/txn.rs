@@ -12,11 +12,11 @@
 // limitations under the License.
 
 use std::fmt;
-use storage::{Key, Value, Mutation, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use storage::{Key, Value, Mutation, CF_DEFAULT, CF_LOCK, CF_WRITE, CF_KEY};
 use storage::engine::{Snapshot, Modify, ScanMode};
 use super::reader::MvccReader;
 use super::lock::{LockType, Lock};
-use super::write::{WriteType, Write};
+use super::write::{WriteType, Write, LatestWrite};
 use super::{Error, Result};
 use super::metrics::*;
 
@@ -95,9 +95,9 @@ impl<'a> MvccTxn<'a> {
 
     pub fn prewrite(&mut self, mutation: Mutation, primary: &[u8], lock_ttl: u64) -> Result<()> {
         let key = mutation.key();
-        if let Some((commit, _)) = try!(self.reader.seek_write(&key, u64::max_value())) {
+        if let Some(latest_write) = try!(self.reader.load_latest_write(&key)) {
             // Abort on writes after our start timestamp ...
-            if commit >= self.start_ts {
+            if latest_write.commit_ts >= self.start_ts {
                 return Err(Error::WriteConflict);
             }
         }
@@ -144,6 +144,11 @@ impl<'a> MvccTxn<'a> {
         };
         let write = Write::new(WriteType::from_lock_type(lock_type), self.start_ts);
         self.put_write(key, commit_ts, write.to_bytes());
+        self.writes.push(Modify::Put(CF_WRITE, key.append_ts(commit_ts), write.to_bytes()));
+        let latest_write = LatestWrite::new(WriteType::from_lock_type(lock_type),
+                                            self.start_ts,
+                                            commit_ts);
+        self.writes.push(Modify::Put(CF_KEY, key.clone(), latest_write.to_bytes()));
         self.unlock_key(key.clone());
         Ok(())
     }
@@ -171,6 +176,15 @@ impl<'a> MvccTxn<'a> {
         let write = Write::new(WriteType::Rollback, self.start_ts);
         let ts = self.start_ts;
         self.put_write(key, ts, write.to_bytes());
+        self.writes.push(Modify::Put(CF_WRITE,
+                                     key.append_ts(self.start_ts),
+                                     Write::new(WriteType::Rollback, self.start_ts).to_bytes()));
+        self.writes.push(Modify::Put(CF_KEY,
+                                     key.clone(),
+                                     LatestWrite::new(WriteType::Rollback,
+                                                      self.start_ts,
+                                                      self.start_ts)
+                                         .to_bytes()));
         self.unlock_key(key.clone());
         Ok(())
     }
@@ -178,8 +192,8 @@ impl<'a> MvccTxn<'a> {
     pub fn gc(&mut self, key: &Key, safe_point: u64) -> Result<()> {
         let mut remove_older = false;
         let mut ts: u64 = u64::max_value();
-        let mut versions = 0;
-        let mut delete_versions = 0;
+        let mut versions: u64 = 0;
+        let mut delete_versions: u64 = 0;
         while let Some((commit, write)) = try!(self.reader.seek_write(key, ts)) {
             if self.write_size >= MAX_TXN_WRITE_SIZE {
                 break;
@@ -213,6 +227,10 @@ impl<'a> MvccTxn<'a> {
             }
             ts = commit - 1;
             versions += 1;
+        }
+        // Left nothing for this key.
+        if delete_versions == versions {
+            self.writes.push(Modify::Delete(CF_KEY, key.clone()));
         }
         MVCC_VERSIONS_HISTOGRAM.observe(versions as f64);
         if delete_versions > 0 {

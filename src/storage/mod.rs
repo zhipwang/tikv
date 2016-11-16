@@ -41,7 +41,8 @@ pub const CF_DEFAULT: CfName = "default";
 pub const CF_LOCK: CfName = "lock";
 pub const CF_WRITE: CfName = "write";
 pub const CF_RAFT: CfName = "raft";
-pub const ALL_CFS: &'static [CfName] = &[CF_DEFAULT, CF_LOCK, CF_WRITE, CF_RAFT];
+pub const CF_KEY: CfName = "key";
+pub const ALL_CFS: &'static [CfName] = &[CF_DEFAULT, CF_LOCK, CF_WRITE, CF_RAFT, CF_KEY];
 
 #[derive(Debug, Clone)]
 pub enum Mutation {

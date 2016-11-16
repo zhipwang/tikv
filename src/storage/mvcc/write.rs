@@ -88,3 +88,37 @@ impl Write {
         Ok(Write::new(write_type, start_ts))
     }
 }
+
+pub struct LatestWrite {
+    pub write_type: WriteType,
+    pub start_ts: u64,
+    pub commit_ts: u64,
+}
+
+impl LatestWrite {
+    pub fn new(write_type: WriteType, start_ts: u64, commit_ts: u64) -> LatestWrite {
+        LatestWrite {
+            write_type: write_type,
+            start_ts: start_ts,
+            commit_ts: commit_ts,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(1 + MAX_VAR_U64_LEN + MAX_VAR_U64_LEN);
+        b.push(self.write_type.to_u8());
+        b.encode_var_u64(self.start_ts).unwrap();
+        b.encode_var_u64(self.commit_ts).unwrap();
+        b
+    }
+
+    pub fn parse(mut b: &[u8]) -> Result<LatestWrite> {
+        if b.len() == 0 {
+            return Err(Error::BadFormatWrite);
+        }
+        let write_type = try!(WriteType::from_u8(try!(b.read_u8())).ok_or(Error::BadFormatWrite));
+        let start_ts = try!(b.decode_var_u64());
+        let commit_ts = try!(b.decode_var_u64());
+        Ok(LatestWrite::new(write_type, start_ts, commit_ts))
+    }
+}
