@@ -13,12 +13,13 @@
 
 
 use std::fs;
+use std::time::{Duration, Instant};
 use std::sync::{Arc, RwLock, Mutex};
 use std::sync::mpsc::{self, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tikv::pd::PdClient;
 use tikv::raftstore::Result;
+use tikv::raftstore::store::Msg;
 use tikv::util::HandyRwLock;
 use kvproto::eraftpb::{Message, MessageType};
 use kvproto::raft_serverpb::RaftMessage;
@@ -106,28 +107,20 @@ fn test_snap_gc<T: Simulator>(cluster: &mut Cluster<T>) {
     cluster.cfg.raft_store.snap_mgr_gc_tick_interval = 50;
     cluster.cfg.raft_store.snap_gc_timeout = 2;
 
-    // We use three nodes([1, 2, 3]) for this test.
-    cluster.run();
-
-    // guarantee node 1 is leader
-    cluster.must_transfer_leader(1, new_peer(1, 1));
-    cluster.must_put(b"k0", b"v0");
-    assert_eq!(cluster.leader_of_region(1), Some(new_peer(1, 1)));
-
     let pd_client = cluster.pd_client.clone();
-
-    // isolate node 3 for region 1, but keep the heartbeat to make
-    // 3 not vote after filters are cleared.
-    cluster.add_send_filter(CloneFilterFactory(RegionPacketFilter::new(1, 3)
-        .msg_type(MessageType::MsgSnapshot)));
-    cluster.add_send_filter(CloneFilterFactory(RegionPacketFilter::new(1, 3)
-        .msg_type(MessageType::MsgAppend)));
+    // Disable default max peer count check.
+    pd_client.disable_default_rule();
+    let r1 = cluster.run_conf_change();
     cluster.must_put(b"k1", b"v1");
+    pd_client.must_add_peer(r1, new_peer(2, 2));
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+    let (tx, rx) = mpsc::channel();
+    // drop all the snapshot so we can detect stale snapfile.
+    cluster.sim.wl().add_recv_filter(3, box DropSnapshotFilter::new(tx));
+    pd_client.must_add_peer(r1, new_peer(3, 3));
 
-    let region = pd_client.get_region(b"").unwrap();
+    let first_snap_idx = rx.recv_timeout(Duration::from_secs(3)).unwrap();
 
-    // split (-inf, +inf) -> (-inf, k2), [k2, +inf]
-    cluster.must_split(&region, b"k2");
     cluster.must_put(b"k2", b"v2");
 
     // node 1 and node 2 must have k2, but node 3 must not.
@@ -146,19 +139,30 @@ fn test_snap_gc<T: Simulator>(cluster: &mut Cluster<T>) {
         cluster.must_put(b"k2", b"v2");
     }
 
+    let mut now = Instant::now();
+    loop {
+        let snap_index = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        if snap_index != first_snap_idx {
+            break;
+        }
+        if now.elapsed() >= Duration::from_secs(5) {
+            panic!("can't get any snap after {}", first_snap_idx);
+        }
+    }
+
     let snap_dir = cluster.get_snap_dir(3);
     // it must have more than 2 snaps.
     let snapfiles: Vec<_> = fs::read_dir(snap_dir).unwrap().map(|p| p.unwrap().path()).collect();
-    assert!(snapfiles.len() > 2);
+    assert!(snapfiles.len() >= 2);
 
-    cluster.clear_send_filters();
+    cluster.sim.wl().clear_recv_filters(3);
     debug!("filters cleared.");
 
     // node 3 must have k1, k2.
     must_get_equal(&engine3, b"k1", b"v1");
     must_get_equal(&engine3, b"k2", b"v2");
 
-    let mut tried_cnt = 0;
+    now = Instant::now();
     loop {
         let mut snap_files = vec![];
         for i in 1..4 {
@@ -169,10 +173,9 @@ fn test_snap_gc<T: Simulator>(cluster: &mut Cluster<T>) {
         if snap_files.is_empty() {
             return;
         }
-        if tried_cnt > 200 {
+        if now.elapsed() > Duration::from_secs(10) {
             panic!("snap files is still not empty: {:?}", snap_files);
         }
-        tried_cnt += 1;
         // trigger log compaction.
         cluster.must_put(b"k2", b"v2");
         sleep_ms(20);
@@ -355,4 +358,90 @@ fn test_node_stale_snap() {
     must_get_none(&cluster.get_engine(3), b"k3");
     cluster.clear_send_filters();
     must_get_equal(&cluster.get_engine(3), b"k3", b"v3");
+}
+
+/// Pause Snap and wait till first append message arrives.
+pub struct SnapshotAppendFilter {
+    stale: AtomicBool,
+    pending_msg: Mutex<Vec<Msg>>,
+    notifier: Mutex<Sender<()>>,
+}
+
+impl SnapshotAppendFilter {
+    pub fn new(notifier: Sender<()>) -> SnapshotAppendFilter {
+        SnapshotAppendFilter {
+            stale: AtomicBool::new(false),
+            pending_msg: Mutex::new(vec![]),
+            notifier: Mutex::new(notifier),
+        }
+    }
+}
+
+impl Filter<Msg> for SnapshotAppendFilter {
+    fn before(&self, msgs: &mut Vec<Msg>) -> Result<()> {
+        if self.stale.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut to_send = vec![];
+        let mut pending_msg = self.pending_msg.lock().unwrap();
+        let mut stale = false;
+        for m in msgs.drain(..) {
+            let mut should_collect = false;
+            if let Msg::RaftMessage(ref msg) = m {
+                should_collect = !stale &&
+                                 msg.get_message().get_msg_type() == MessageType::MsgSnapshot;
+                stale = !pending_msg.is_empty() &&
+                        msg.get_message().get_msg_type() == MessageType::MsgAppend;
+            }
+            if should_collect {
+                pending_msg.push(m);
+                self.notifier.lock().unwrap().send(()).unwrap();
+            } else {
+                if stale {
+                    to_send.extend(pending_msg.drain(..));
+                }
+                to_send.push(m);
+            }
+        }
+        self.stale.store(stale, Ordering::SeqCst);
+        msgs.extend(to_send);
+        Ok(())
+    }
+}
+
+fn test_snapshot_with_append<T: Simulator>(cluster: &mut Cluster<T>) {
+    // truncate the log quickly so that we can force sending snapshot.
+    cluster.cfg.raft_store.raft_log_gc_tick_interval = 20;
+    cluster.cfg.raft_store.raft_log_gc_limit = 2;
+    cluster.cfg.raft_store.snap_mgr_gc_tick_interval = 50;
+    cluster.cfg.raft_store.snap_gc_timeout = 2;
+
+    let pd_client = cluster.pd_client.clone();
+    // Disable default max peer count check.
+    pd_client.disable_default_rule();
+    let r1 = cluster.run_conf_change();
+    pd_client.must_add_peer(r1, new_peer(2, 2));
+    pd_client.must_add_peer(r1, new_peer(3, 3));
+
+    let (tx, rx) = mpsc::channel();
+    cluster.sim.wl().add_recv_filter(4, box SnapshotAppendFilter::new(tx));
+    pd_client.add_peer(r1, new_peer(4, 4));
+    rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k2", b"v2");
+    let engine4 = cluster.get_engine(4);
+    must_get_equal(&engine4, b"k1", b"v1");
+    must_get_equal(&engine4, b"k2", b"v2");
+}
+
+#[test]
+fn test_node_snapshot_with_append() {
+    let mut cluster = new_node_cluster(0, 4);
+    test_snapshot_with_append(&mut cluster);
+}
+
+#[test]
+fn test_server_snapshot_with_append() {
+    let mut cluster = new_server_cluster(0, 4);
+    test_snapshot_with_append(&mut cluster);
 }

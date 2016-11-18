@@ -25,11 +25,11 @@ pub mod engine;
 pub mod mvcc;
 pub mod txn;
 pub mod config;
-mod types;
+pub mod types;
 mod metrics;
 
 pub use self::config::Config;
-pub use self::engine::{Engine, Snapshot, Dsn, TEMP_DIR, new_engine, Modify, Cursor,
+pub use self::engine::{Engine, Snapshot, TEMP_DIR, new_local_engine, Modify, Cursor,
                        Error as EngineError, ScanMode};
 pub use self::engine::raftkv::RaftKv;
 pub use self::txn::{SnapshotStore, Scheduler, Msg};
@@ -86,6 +86,7 @@ pub enum Command {
         ctx: Context,
         start_key: Key,
         limit: usize,
+        key_only: bool,
         start_ts: u64,
     },
     Prewrite {
@@ -93,6 +94,7 @@ pub enum Command {
         mutations: Vec<Mutation>,
         primary: Vec<u8>,
         start_ts: u64,
+        lock_ttl: u64,
     },
     Commit {
         ctx: Context,
@@ -115,6 +117,8 @@ pub enum Command {
         ctx: Context,
         start_ts: u64,
         commit_ts: Option<u64>,
+        scan_key: Option<Key>,
+        keys: Vec<Key>,
     },
     Gc {
         ctx: Context,
@@ -203,8 +207,8 @@ impl Command {
             Command::Get { .. } |
             Command::BatchGet { .. } |
             Command::Scan { .. } |
-            Command::ScanLock { .. } |
-            Command::ResolveLock { .. } => true,
+            Command::ScanLock { .. } => true,
+            Command::ResolveLock { ref keys, .. } |
             Command::Gc { ref keys, .. } => keys.is_empty(),
             _ => false,
         }
@@ -243,7 +247,7 @@ impl Storage {
     pub fn from_engine(engine: Box<Engine>, config: &Config) -> Result<Storage> {
         let event_loop = try!(create_event_loop(config.sched_notify_capacity,
                                                 config.sched_msg_per_tick));
-        let sendch = SendCh::new(event_loop.channel());
+        let sendch = SendCh::new(event_loop.channel(), "kv-storage");
 
         info!("storage {:?} started.", engine);
         Ok(Storage {
@@ -257,7 +261,7 @@ impl Storage {
     }
 
     pub fn new(config: &Config) -> Result<Storage> {
-        let engine = try!(engine::new_engine(Dsn::RocksDBPath(&config.path), ALL_CFS));
+        let engine = try!(engine::new_local_engine(&config.path, ALL_CFS));
         Storage::from_engine(engine, config)
     }
 
@@ -357,6 +361,7 @@ impl Storage {
                       ctx: Context,
                       start_key: Key,
                       limit: usize,
+                      key_only: bool,
                       start_ts: u64,
                       callback: Callback<Vec<Result<KvPair>>>)
                       -> Result<()> {
@@ -364,6 +369,7 @@ impl Storage {
             ctx: ctx,
             start_key: start_key,
             limit: limit,
+            key_only: key_only,
             start_ts: start_ts,
         };
         let tag = cmd.tag();
@@ -377,6 +383,7 @@ impl Storage {
                           mutations: Vec<Mutation>,
                           primary: Vec<u8>,
                           start_ts: u64,
+                          lock_ttl: u64,
                           callback: Callback<Vec<Result<()>>>)
                           -> Result<()> {
         let cmd = Command::Prewrite {
@@ -384,6 +391,7 @@ impl Storage {
             mutations: mutations,
             primary: primary,
             start_ts: start_ts,
+            lock_ttl: lock_ttl,
         };
         let tag = cmd.tag();
         try!(self.send(cmd, StorageCb::Booleans(callback)));
@@ -469,6 +477,8 @@ impl Storage {
             ctx: ctx,
             start_ts: start_ts,
             commit_ts: commit_ts,
+            scan_key: None,
+            keys: vec![],
         };
         let tag = cmd.tag();
         try!(self.send(cmd, StorageCb::Boolean(callback)));
@@ -629,6 +639,7 @@ mod tests {
                             vec![Mutation::Put((make_key(b"x"), b"100".to_vec()))],
                             b"x".to_vec(),
                             100,
+                            0,
                             expect_ok(tx.clone()))
             .unwrap();
         rx.recv().unwrap();
@@ -658,7 +669,7 @@ mod tests {
     fn test_put_with_err() {
         let config = Config::new();
         // New engine lack of some column families.
-        let engine = engine::new_engine(Dsn::RocksDBPath(&config.path), &["default"]).unwrap();
+        let engine = engine::new_local_engine(&config.path, &["default"]).unwrap();
         let mut storage = Storage::from_engine(engine, &config).unwrap();
         storage.start(&config).unwrap();
         let (tx, rx) = channel();
@@ -670,6 +681,7 @@ mod tests {
             ],
                             b"a".to_vec(),
                             1,
+                            0,
                             expect_fail(tx.clone()))
             .unwrap();
         rx.recv().unwrap();
@@ -690,6 +702,7 @@ mod tests {
             ],
                             b"a".to_vec(),
                             1,
+                            0,
                             expect_ok(tx.clone()))
             .unwrap();
         rx.recv().unwrap();
@@ -703,6 +716,7 @@ mod tests {
         storage.async_scan(Context::new(),
                         make_key(b"\x00"),
                         1000,
+                        false,
                         5,
                         expect_scan(tx.clone(),
                                     vec![
@@ -729,6 +743,7 @@ mod tests {
             ],
                             b"a".to_vec(),
                             1,
+                            0,
                             expect_ok(tx.clone()))
             .unwrap();
         rx.recv().unwrap();
@@ -763,12 +778,14 @@ mod tests {
                             vec![Mutation::Put((make_key(b"x"), b"100".to_vec()))],
                             b"x".to_vec(),
                             100,
+                            0,
                             expect_ok(tx.clone()))
             .unwrap();
         storage.async_prewrite(Context::new(),
                             vec![Mutation::Put((make_key(b"y"), b"101".to_vec()))],
                             b"y".to_vec(),
                             101,
+                            0,
                             expect_ok(tx.clone()))
             .unwrap();
         rx.recv().unwrap();
@@ -803,6 +820,7 @@ mod tests {
                             vec![Mutation::Put((make_key(b"x"), b"105".to_vec()))],
                             b"x".to_vec(),
                             105,
+                            0,
                             expect_fail(tx.clone()))
             .unwrap();
         rx.recv().unwrap();
@@ -826,7 +844,34 @@ mod tests {
                             vec![Mutation::Put((make_key(b"x"), b"100".to_vec()))],
                             b"x".to_vec(),
                             100,
+                            0,
                             expect_too_busy(tx.clone()))
+            .unwrap();
+        rx.recv().unwrap();
+        storage.stop().unwrap();
+    }
+
+    #[test]
+    fn test_cleanup() {
+        let config = Config::new();
+        let mut storage = Storage::new(&config).unwrap();
+        storage.start(&config).unwrap();
+        let (tx, rx) = channel();
+        storage.async_prewrite(Context::new(),
+                            vec![Mutation::Put((make_key(b"x"), b"100".to_vec()))],
+                            b"x".to_vec(),
+                            100,
+                            0,
+                            expect_ok(tx.clone()))
+            .unwrap();
+        rx.recv().unwrap();
+        storage.async_cleanup(Context::new(), make_key(b"x"), 100, expect_ok(tx.clone()))
+            .unwrap();
+        rx.recv().unwrap();
+        storage.async_get(Context::new(),
+                       make_key(b"x"),
+                       105,
+                       expect_get_none(tx.clone()))
             .unwrap();
         rx.recv().unwrap();
         storage.stop().unwrap();

@@ -15,6 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use std::boxed::FnBox;
 use std::ops::Deref;
 use std::fs;
 
@@ -71,6 +72,7 @@ impl Channel<RaftMessage> for ChannelTransport {
         let from_store = msg.get_from_peer().get_store_id();
         let to_store = msg.get_to_peer().get_store_id();
         let to_peer_id = msg.get_to_peer().get_id();
+        let to_store_id = msg.get_to_peer().get_store_id();
         let region_id = msg.get_region_id();
         let is_snapshot = msg.get_message().get_msg_type() == MessageType::MsgSnapshot;
 
@@ -112,7 +114,10 @@ impl Channel<RaftMessage> for ChannelTransport {
                         .routers
                         .get(&from_store)
                         .unwrap()
-                        .report_snapshot(region_id, to_peer_id, SnapshotStatus::Finish)
+                        .report_snapshot(region_id,
+                                         to_peer_id,
+                                         to_store_id,
+                                         SnapshotStatus::Finish)
                         .unwrap();
                 }
                 Ok(())
@@ -139,6 +144,13 @@ impl NodeCluster {
             nodes: HashMap::new(),
             simulate_trans: HashMap::new(),
         }
+    }
+}
+
+impl NodeCluster {
+    #[allow(dead_code)]
+    pub fn get_node_router(&self, node_id: u64) -> SimulateTransport<Msg, ServerRaftStoreRouter> {
+        self.trans.rl().routers.get(&node_id).cloned().unwrap()
     }
 }
 
@@ -204,15 +216,10 @@ impl Simulator for NodeCluster {
         }
 
         let router = self.trans.rl().routers.get(&node_id).cloned().unwrap();
-        wait_event!(|cb: Box<Fn(RaftCmdResponse) + 'static + Send>| {
-            router.send_command(request,
-                              box move |resp| {
-                                  cb(resp);
-                                  Ok(())
-                              })
-                .unwrap()
-        },
-                    timeout)
+        wait_op!(|cb: Box<FnBox(RaftCmdResponse) + 'static + Send>| {
+                     router.send_command(request, cb).unwrap()
+                 },
+                 timeout)
             .ok_or_else(|| Error::Timeout(format!("request timeout for {:?}", timeout)))
     }
 

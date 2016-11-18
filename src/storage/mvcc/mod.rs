@@ -15,10 +15,13 @@ mod reader;
 mod txn;
 mod lock;
 mod write;
+mod metrics;
 
 use std::io;
 pub use self::txn::MvccTxn;
 pub use self::reader::MvccReader;
+pub use self::lock::{Lock, LockType};
+pub use self::write::{Write, WriteType};
 use util::escape;
 
 quick_error! {
@@ -39,9 +42,13 @@ quick_error! {
             cause(err)
             description(err.description())
         }
-        KeyIsLocked {key: Vec<u8>, primary: Vec<u8>, ts: u64} {
+        KeyIsLocked {key: Vec<u8>, primary: Vec<u8>, ts: u64, ttl: u64} {
             description("key is locked (backoff or cleanup)")
-            display("key is locked (backoff or cleanup) {}-{}@{}", escape(key), escape(primary), ts)
+            display("key is locked (backoff or cleanup) {}-{}@{} ttl {}",
+                        escape(key),
+                        escape(primary),
+                        ts,
+                        ttl)
         }
         BadFormatLock {description("bad format lock data")}
         BadFormatWrite {description("bad format write data")}

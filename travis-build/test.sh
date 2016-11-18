@@ -14,6 +14,14 @@
 
 set -o pipefail
 
+panic() {
+    echo -e "$@" >&1
+    exit 1
+}
+
+make format
+git diff-index --quiet HEAD -- || panic "\e[35mplease make format before creating a pr!!!\e[0m" 
+
 trap 'kill $(jobs -p) &> /dev/null || true' EXIT
 
 # start pd
@@ -24,11 +32,18 @@ if [ $? -eq 0 ]; then
     export PD_ENDPOINTS=127.0.0.1:2379
 fi
 
-export ENABLE_FEATURES=dev
+if [[ "$ENABLE_FEATURES" = "" ]]; then
+    export ENABLE_FEATURES=dev
+fi
 export LOG_FILE=tests.log
 export RUST_TEST_THREADS=1
 export RUSTFLAGS=-Dwarnings
-make test 2>&1 | tee tests.out
+if [[ "$SKIP_TESTS" = "" ]]; then
+    make test 2>&1 | tee tests.out
+else
+    make build
+    exit $?
+fi
 status=$?
 for case in `cat tests.out | python -c "import sys
 import re

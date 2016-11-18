@@ -11,7 +11,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod test_raftkv;
-pub mod sync_storage;
-mod test_storage;
-mod test_raft_storage;
+use prometheus::CounterVec;
+
+lazy_static! {
+    pub static ref CHANNEL_FULL_COUNTER_VEC: CounterVec =
+        register_counter_vec!(
+            "tikv_channel_full_total",
+            "Total number of channel full errors.",
+            &["type"]
+        ).unwrap();
+}

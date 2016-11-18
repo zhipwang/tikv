@@ -566,7 +566,7 @@ impl<T: Simulator> Cluster<T> {
         let mut try_cnt = 0;
         loop {
             self.reset_leader_of_region(region_id);
-            if self.leader_of_region(region_id).as_ref().unwrap() == &leader {
+            if self.leader_of_region(region_id) == Some(leader.clone()) {
                 return;
             }
             if try_cnt > 250 {
@@ -626,6 +626,30 @@ impl<T: Simulator> Cluster<T> {
             try_cnt += 1;
             sleep_ms(20);
         }
+    }
+
+    /// Make sure region exists on that store.
+    pub fn must_region_exist(&mut self, region_id: u64, store_id: u64) {
+        let mut try_cnt = 0;
+        loop {
+            let find_leader =
+                new_status_request(region_id, new_peer(store_id, 0), new_region_leader_cmd());
+            let resp = self.call_command(find_leader, Duration::from_secs(5)).unwrap();
+
+            if !is_error_response(&resp) {
+                return;
+            }
+
+            if try_cnt > 250 {
+                panic!("region {} doesn't exist on store {} after {} tries",
+                       region_id,
+                       store_id,
+                       try_cnt);
+            }
+            try_cnt += 1;
+            sleep_ms(20);
+        }
+
     }
 
     // it's so common that we provide an API for it

@@ -25,7 +25,7 @@ use rand::{self, Rng};
 use kvproto::pdpb::{Request, Response};
 use kvproto::msgpb::{Message, MessageType};
 
-use super::Result;
+use super::{Result, PdClient};
 use super::metrics::*;
 
 const MAX_PD_SEND_RETRY_COUNT: usize = 100;
@@ -105,8 +105,7 @@ impl RpcClientCore {
         for _ in 0..MAX_PD_SEND_RETRY_COUNT {
             // If no stream, try connect first.
             if self.stream.is_none() {
-                if let Err(e) = self.try_connect() {
-                    warn!("connect pd failed {:?}", e);
+                if let Err(_) = self.try_connect() {
                     // TODO: figure out a better way to do backoff
                     thread::sleep(Duration::from_millis(50));
                     continue;
@@ -147,12 +146,26 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
-    pub fn new(endpoints: &str, cluster_id: u64) -> Result<RpcClient> {
-        Ok(RpcClient {
+    pub fn new(endpoints: &str) -> Result<RpcClient> {
+        let mut client = RpcClient {
             msg_id: AtomicUsize::new(0),
             core: Mutex::new(RpcClientCore::new(endpoints)),
-            cluster_id: cluster_id,
-        })
+            cluster_id: 0,
+        };
+
+        for _ in 0..MAX_PD_SEND_RETRY_COUNT {
+            match client.get_cluster_id() {
+                Ok(id) => {
+                    client.cluster_id = id;
+                    return Ok(client);
+                }
+                Err(e) => {
+                    warn!("failed to get cluster id from pd: {:?}", e);
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+        Err(box_err!("failed to get cluster id from pd"))
     }
 
     pub fn send(&self, req: &Request) -> Result<Response> {

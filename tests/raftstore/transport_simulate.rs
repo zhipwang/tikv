@@ -22,10 +22,9 @@ use tikv::util::transport;
 
 use rand;
 use std::sync::{Arc, RwLock, Mutex};
+use std::sync::mpsc::Sender;
 use std::marker::PhantomData;
-use std::time;
-use std::usize;
-use std::thread;
+use std::{time, usize, thread};
 use std::vec::Vec;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -410,6 +409,37 @@ impl Filter<StoreMsg> for PauseFirstSnapshotFilter {
         } else {
             res
         }
+    }
+}
+
+pub struct DropSnapshotFilter {
+    notifier: Mutex<Sender<u64>>,
+}
+
+impl DropSnapshotFilter {
+    pub fn new(ch: Sender<u64>) -> DropSnapshotFilter {
+        DropSnapshotFilter { notifier: Mutex::new(ch) }
+    }
+}
+
+impl Filter<StoreMsg> for DropSnapshotFilter {
+    fn before(&self, msgs: &mut Vec<StoreMsg>) -> Result<()> {
+        let notifier = self.notifier.lock().unwrap();
+        msgs.retain(|m| {
+            match *m {
+                StoreMsg::RaftMessage(ref msg) => {
+                    if msg.get_message().get_msg_type() != MessageType::MsgSnapshot {
+                        true
+                    } else {
+                        notifier.send(msg.get_message().get_snapshot().get_metadata().get_index())
+                            .unwrap();
+                        false
+                    }
+                }
+                _ => true,
+            }
+        });
+        Ok(())
     }
 }
 

@@ -3,9 +3,8 @@ use tikv::server::coprocessor;
 use kvproto::kvrpcpb::Context;
 use tikv::util::codec::{table, Datum, datum};
 use tikv::util::codec::number::*;
-use tikv::storage::{Dsn, Mutation, Key, ALL_CFS};
+use tikv::storage::{Mutation, Key, ALL_CFS};
 use tikv::storage::engine::{self, Engine, TEMP_DIR};
-use tikv::util::event::Event;
 use tikv::util::worker::Worker;
 use kvproto::coprocessor::{Request, KeyRange};
 use tipb::select::{ByItem, SelectRequest, SelectResponse, Chunk};
@@ -14,6 +13,7 @@ use tipb::expression::{Expr, ExprType};
 use storage::sync_storage::SyncStorage;
 
 use std::collections::{HashMap, BTreeMap};
+use std::sync::mpsc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::i64;
 use protobuf::{RepeatedField, Message};
@@ -518,7 +518,7 @@ impl ProductTable {
 fn init_with_data(tbl: &ProductTable,
                   vals: &[(i64, Option<&str>, i64)])
                   -> (Store, Worker<EndPointTask>) {
-    let engine = engine::new_engine(Dsn::RocksDBPath(TEMP_DIR), ALL_CFS).unwrap();
+    let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();
     let mut store = Store::new(engine);
 
     store.begin();
@@ -886,12 +886,10 @@ fn test_reverse() {
 }
 
 fn handle_select(end_point: &Worker<EndPointTask>, req: Request) -> SelectResponse {
-    let finish = Event::new();
-    let finish_clone = finish.clone();
-    let req = RequestTask::new(req, box move |r| finish_clone.set(r));
+    let (tx, rx) = mpsc::channel();
+    let req = RequestTask::new(req, box move |r| tx.send(r).unwrap());
     end_point.schedule(EndPointTask::Request(req)).unwrap();
-    finish.wait_timeout(None);
-    let resp = finish.take().unwrap().take_cop_resp();
+    let resp = rx.recv().unwrap().take_cop_resp();
     assert!(resp.has_data(), format!("{:?}", resp));
     let mut sel_resp = SelectResponse::new();
     sel_resp.merge_from_bytes(resp.get_data()).unwrap();
