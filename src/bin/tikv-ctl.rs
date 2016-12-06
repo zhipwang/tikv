@@ -22,12 +22,16 @@ extern crate rocksdb;
 extern crate tempdir;
 
 use std::{str, u64};
+use std::time::Instant;
+
 use clap::{Arg, App, SubCommand};
 use protobuf::Message;
+use rocksdb::DB;
+
 use kvproto::raft_cmdpb::RaftCmdRequest;
 use kvproto::raft_serverpb::{RaftLocalState, RegionLocalState, RaftApplyState, PeerState};
 use kvproto::eraftpb::Entry;
-use rocksdb::DB;
+
 use tikv::util::{self, escape, unescape};
 use tikv::util::codec::bytes::encode_bytes;
 use tikv::raftstore::store::keys;
@@ -111,7 +115,21 @@ fn main() {
             .arg(Arg::with_name("encoded")
                 .short("e")
                 .takes_value(false)
-                .help("set it when the key is already encoded.")));
+                .help("set it when the key is already encoded.")))
+        .subcommand(SubCommand::with_name("compact")
+            .about("compact the specified cf and ranges")
+            .arg(Arg::with_name("from")
+                .short("f")
+                .takes_value(true)
+                .help("set the scan from raw key, in escaped format"))
+            .arg(Arg::with_name("to")
+                .short("t")
+                .takes_value(true)
+                .help("set the scan end raw key, in escaped format"))
+            .arg(Arg::with_name("cf")
+                .short("c")
+                .takes_value(true)
+                .help("column family name")));
     let matches = app.clone().get_matches();
 
     let db_path = matches.value_of("db").unwrap();
@@ -178,6 +196,22 @@ fn main() {
                 let _ = app.print_help();
             }
         }
+    } else if let Some(matches) = matches.subcommand_matches("compact") {
+        let cf_name = matches.value_of("cf").unwrap_or("default");
+        let from = matches.value_of("from");
+        let to = matches.value_of("to");
+        let cf_handle = util::rocksdb::get_cf_handle(&db, cf_name).unwrap();
+        let timer = Instant::now();
+        let from_key = from.map(|s| escape(s.as_bytes()));
+        let to_key = to.map(|s| escape(s.as_bytes()));
+        db.compact_range_cf(cf_handle,
+                            from_key.as_ref().map(|s| s.as_bytes()),
+                            to_key.as_ref().map(|s| s.as_bytes()));
+        println!("compact range {} [{:?}, {:?}) takes {:?}",
+                 cf_name,
+                 from,
+                 to,
+                 timer.elapsed());
     } else {
         let _ = app.print_help();
     }
