@@ -108,10 +108,11 @@ fn send_snap(mgr: SnapManager, addr: SocketAddr, data: ConnData) -> Result<()> {
         .map(|_| ())
         .map_err(From::from);
     if let Ok(meta) = snap_file.meta() {
-        debug!("sending snapshot[path: {}, size: {}] takes {:?}",
-               snap_file.path().display(),
-               meta.len(),
-               timer.elapsed());
+        info!("[region {}] sent snapshot {} [size: {}, dur: {:?}]",
+              key.region_id,
+              key,
+              meta.len(),
+              timer.elapsed());
     }
 
     send_timer.observe_duration();
