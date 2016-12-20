@@ -51,8 +51,8 @@ use super::{util, Msg, Tick, SnapshotStatusMsg, SnapManager};
 use super::keys::{self, enc_start_key, enc_end_key, data_end_key, data_key};
 use super::engine::{Iterable, Peekable, Snapshot as EngineSnapshot};
 use super::config::Config;
-use super::peer::{Peer, PendingCmd, ReadyResult, ExecResult, StaleState, ConsistencyState,
-                  ReadyContext};
+use super::peer::{Peer, PendingCmd, ExecResult, StaleState, ConsistencyState, ReadyContext,
+                  BatchApplyContext, ApplyContext};
 use super::peer_storage::ApplySnapResult;
 use super::msg::Callback;
 use super::cmd_resp::{bind_uuid, bind_term, bind_error};
@@ -800,12 +800,28 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                   self.raft_metrics.ready.message - previous_ready_metrics.message,
                   self.raft_metrics.ready.snapshot - previous_ready_metrics.snapshot);
 
-        for (region_id, ready, mut res) in ready_results {
+        let mut batch_ctx = BatchApplyContext::new();
+        for (region_id, ready, res) in ready_results {
+            let apply_ctx = ApplyContext::new(region_id, res);
+            batch_ctx.ctxs.push(apply_ctx);
             self.region_peers
                 .get_mut(&region_id)
                 .unwrap()
-                .handle_raft_ready_apply(ready, &mut res);
-            self.on_ready_result(region_id, res)
+                .handle_raft_ready_apply(ready, &mut batch_ctx);
+        }
+
+        let wb = batch_ctx.wb.unwrap();
+        if !wb.is_empty() {
+            // Commit write and change storage fields atomically.
+            self.engine
+                .write(wb)
+                .unwrap_or_else(|e| panic!("{} failed to commit apply result: {:?}", self.tag, e));
+        }
+        for mut apply_ctx in batch_ctx.ctxs {
+            for (resp, cb) in apply_ctx.cbs.drain(..) {
+                cb(resp);
+            }
+            self.on_ready_result(apply_ctx.region_id, apply_ctx);
         }
 
         let dur = t.elapsed();
@@ -1001,7 +1017,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         self.region_ranges.insert(enc_end_key(&region), region.get_id());
     }
 
-    fn on_ready_result(&mut self, region_id: u64, ready_result: ReadyResult) {
+    fn on_ready_result(&mut self, region_id: u64, ready_result: ApplyContext) {
         if let Some(apply_result) = ready_result.apply_snap_result {
             self.on_ready_apply_snapshot(apply_result);
         }

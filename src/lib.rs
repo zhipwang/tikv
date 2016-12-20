@@ -13,6 +13,9 @@
 
 #![crate_type = "lib"]
 #![allow(stable_features)]
+// TiKV is not meant to be a library project, hence it's find to use empty new without
+// implement default.
+#![allow(new_without_default_derive)]
 #![feature(mpsc_recv_timeout)]
 #![feature(test)]
 #![feature(optin_builtin_traits)]
