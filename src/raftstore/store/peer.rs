@@ -12,6 +12,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::sync::mpsc::{Sender, Receiver};
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -41,11 +42,9 @@ use storage::{CF_LOCK, CF_RAFT};
 use super::store::Store;
 use super::peer_storage::{PeerStorage, ApplySnapResult, write_initial_state, write_peer_state,
                           InvokeContext};
-use super::util;
-use super::msg::Callback;
-use super::cmd_resp;
+use super::msg::{Callback, ApplyFinish};
 use super::transport::Transport;
-use super::keys;
+use super::{util, cmd_resp, keys};
 use super::engine::{Snapshot, Peekable, Mutable};
 use super::metrics::*;
 use super::local_metrics::{RaftReadyMetrics, RaftMessageMetrics, RaftProposeMetrics, RaftMetrics};
@@ -131,13 +130,19 @@ impl<'a, T> ReadyContext<'a, T> {
 pub struct BatchApplyContext {
     pub wb: Option<WriteBatch>,
     pub ctxs: Vec<ApplyContext>,
+    pub notifier: Option<Sender<ApplyFinish>>,
+    pub receiver: Option<Receiver<ApplyFinish>>,
+    pub applied_regions: Vec<u64>,
 }
 
 impl BatchApplyContext {
-    pub fn new() -> BatchApplyContext {
+    pub fn new(receiver: Option<Receiver<ApplyFinish>>) -> BatchApplyContext {
         BatchApplyContext {
             wb: Some(WriteBatch::new()),
             ctxs: vec![],
+            notifier: None,
+            receiver: receiver,
+            applied_regions: vec![],
         }
     }
 }
@@ -264,6 +269,8 @@ pub struct Peer {
     // Approximate size of logs that is applied but not compacted yet.
     pub raft_log_size_hint: u64,
 
+    pub waiting_apply: bool,
+
     // if we remove ourself in ChangePeer remove, we should set this flag, then
     // any following committed logs in same Ready should be applied failed.
     pending_remove: bool,
@@ -363,6 +370,7 @@ impl Peer {
                 index: INVALID_INDEX,
                 hash: vec![],
             },
+            waiting_apply: false,
             raft_log_size_hint: 0,
             leader_lease_expired_time: None,
             election_timeout: TimeDuration::milliseconds(cfg.raft_base_tick_interval as i64) *
@@ -704,6 +712,13 @@ impl Peer {
     }
 
     pub fn handle_raft_ready_apply(&mut self, mut ready: Ready, ctx: &mut BatchApplyContext) {
+        let is_applying = self.is_applying();
+        let has_committed = !ready.committed_entries.is_empty();
+        if is_applying || has_committed {
+            let receiver = ctx.receiver.as_ref().unwrap();
+            ctx.applied_regions.extend_from_slice(&self.flush_apply(receiver));
+        }
+
         // Call `handle_raft_commit_entries` directly here may lead to inconsistency.
         // In some cases, there will be some pending committed entries when applying a
         // snapshot. If we call `handle_raft_commit_entries` directly, these updates
@@ -711,16 +726,32 @@ impl Peer {
         // updates will soon be removed. But the soft state of raft is still be updated
         // in memory. Hence when handle ready next time, these updates won't be included
         // in `ready.committed_entries` again, which will lead to inconsistency.
-        if self.is_applying() {
+        if is_applying {
             if let Some(ref mut hs) = ready.hs {
                 // Snapshot's metadata has been applied.
                 hs.set_commit(self.get_store().truncated_index());
             }
-        } else {
-            self.handle_raft_commit_entries(&ready.committed_entries, ctx)
+        } else if has_committed {
+            self.handle_raft_commit_entries(&ready.committed_entries, ctx);
         }
 
         self.raft_group.advance(ready);
+    }
+
+    pub fn flush_apply(&mut self, apply_receiver: &Receiver<ApplyFinish>) -> Vec<u64> {
+        let mut applied_regions = vec![];
+        while self.waiting_apply {
+            let regions = match apply_receiver.recv() {
+                Ok(ApplyFinish { region_ids }) => region_ids,
+                Err(e) => panic!("{} failed to flush apply: {:?}", self.tag, e),
+            };
+            applied_regions.extend_from_slice(&regions);
+            if regions.iter().any(|&r| r == self.region_id) {
+                self.waiting_apply = false;
+                break;
+            }
+        }
+        applied_regions
     }
 
     /// Propose a request.
@@ -730,12 +761,13 @@ impl Peer {
                    mut cmd: PendingCmd,
                    req: RaftCmdRequest,
                    mut err_resp: RaftCmdResponse,
-                   metrics: &mut RaftProposeMetrics)
-                   -> bool {
+                   metrics: &mut RaftProposeMetrics,
+                   receiver: &Receiver<ApplyFinish>)
+                   -> (bool, Vec<u64>) {
         if self.pending_cmds.contains(&cmd.uuid) {
             cmd_resp::bind_error(&mut err_resp, box_err!("duplicated uuid {:?}", cmd.uuid));
             cmd.call(err_resp);
-            return false;
+            return (false, vec![]);
         }
 
         debug!("{} propose command with uuid {:?}", self.tag, cmd.uuid);
@@ -744,6 +776,7 @@ impl Peer {
         if self.should_read_local(&req) {
             metrics.local_read += 1;
 
+            let applied_regions = self.flush_apply(receiver);
             // Execute ready-only commands immediately in leader when doing local reads.
             let wb = WriteBatch::new();
             let mut ctx = ExecContext::new(self, wb, 0, 0, &req, true);
@@ -755,7 +788,7 @@ impl Peer {
             cmd_resp::bind_uuid(&mut resp, cmd.uuid);
             cmd_resp::bind_term(&mut resp, self.term());
             cmd.call(resp);
-            return false;
+            return (false, applied_regions);
         } else if get_transfer_leader_cmd(&req).is_some() {
             metrics.transfer_leader += 1;
 
@@ -773,7 +806,7 @@ impl Peer {
             // transfer leader command doesn't need to replicate log and apply, so we
             // return immediately. Note that this command may fail, we can view it just as an advice
             cmd.call(make_transfer_leader_response());
-            return false;
+            return (false, vec![]);
         } else if get_change_peer_cmd(&req).is_some() {
             if self.raft_group.raft.pending_conf {
                 info!("{} there is a pending conf change, try later", self.tag);
@@ -781,7 +814,7 @@ impl Peer {
                                      box_err!("{} there is a pending conf change, try later",
                                               self.tag));
                 cmd.call(err_resp);
-                return false;
+                return (false, vec![]);
             }
             if let Some(cmd) = self.pending_cmds.take_conf_change() {
                 // if it loses leadership before conf change is replicated, there may be
@@ -794,7 +827,7 @@ impl Peer {
             if let Err(e) = self.propose_conf_change(req, metrics) {
                 cmd_resp::bind_error(&mut err_resp, e);
                 cmd.call(err_resp);
-                return false;
+                return (false, vec![]);
             }
 
             // Try to renew leader lease on every conf change request.
@@ -803,14 +836,14 @@ impl Peer {
         } else if let Err(e) = self.propose_normal(req, metrics) {
             cmd_resp::bind_error(&mut err_resp, e);
             cmd.call(err_resp);
-            return false;
+            return (false, vec![]);
         } else {
             // Try to renew leader lease on every consistent read/write request.
             cmd.renew_lease_time = Some(clocktime::raw_now());
             self.pending_cmds.append_normal(cmd);
         }
 
-        true
+        (true, vec![])
     }
 
     fn should_read_local(&mut self, req: &RaftCmdRequest) -> bool {
@@ -1506,7 +1539,9 @@ impl<'a> ExecContext<'a> {
         self.wb.as_mut().unwrap()
     }
 
-    fn write_and_reset(&mut self, peer: &Peer) {
+    fn write_and_reset(&mut self, peer: &mut Peer) {
+        assert!(!peer.waiting_apply);
+        // make sure all previous scheduled writebatch has been written.
         if self.wb.as_ref().unwrap().is_empty() {
             return;
         }

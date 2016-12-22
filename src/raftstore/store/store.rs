@@ -12,7 +12,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver as StdReceiver, TryRecvError};
+use std::sync::mpsc::{self, Sender as StdSender, Receiver as StdReceiver, TryRecvError};
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, BTreeMap};
@@ -27,6 +27,7 @@ use protobuf;
 use fs2;
 use uuid::Uuid;
 use time::{self, Timespec};
+use threadpool::ThreadPool;
 
 use kvproto::raft_serverpb::{RaftMessage, RaftSnapshotData, RaftTruncatedState, RegionLocalState,
                              PeerState};
@@ -54,7 +55,7 @@ use super::config::Config;
 use super::peer::{Peer, PendingCmd, ExecResult, StaleState, ConsistencyState, ReadyContext,
                   BatchApplyContext, ApplyContext};
 use super::peer_storage::ApplySnapResult;
-use super::msg::Callback;
+use super::msg::{ApplyFinish, Callback};
 use super::cmd_resp::{bind_uuid, bind_term, bind_error};
 use super::transport::Transport;
 use super::metrics::*;
@@ -66,6 +67,7 @@ const ROCKSDB_TOTAL_SST_FILES_SIZE_PROPERTY: &'static str = "rocksdb.total-sst-f
 const ROCKSDB_TABLE_READERS_MEM_PROPERTY: &'static str = "rocksdb.estimate-table-readers-mem";
 const ROCKSDB_CUR_SIZE_ALL_MEM_TABLES_PROPERTY: &'static str = "rocksdb.cur-size-all-mem-tables";
 const MIO_TICK_RATIO: u64 = 10;
+const DEFAULT_APPLY_CONCURRENCY: usize = 4;
 
 // A helper structure to bundle all channels for messages to `Store`.
 pub struct StoreChannel {
@@ -94,6 +96,10 @@ pub struct Store<T: Transport, C: PdClient + 'static> {
     compact_worker: Worker<CompactTask>,
     pd_worker: Worker<PdTask>,
     consistency_check_worker: Worker<ConsistencyCheckTask>,
+
+    apply_pool: ThreadPool,
+    apply_notifier: StdSender<ApplyFinish>,
+    apply_receiver: Option<StdReceiver<ApplyFinish>>,
 
     trans: T,
     pd_client: Arc<C>,
@@ -136,6 +142,31 @@ pub fn delete_file_in_range(db: &DB, start_key: &[u8], end_key: &[u8]) -> Result
     Ok(())
 }
 
+fn apply_then_response<S: AsRef<str>>(tag: S, engine: &DB, ctx: &mut BatchApplyContext) {
+    // Commit write and change storage fields atomically.
+    let wb = ctx.wb.take().unwrap();
+    if !wb.is_empty() {
+        engine.write(wb)
+            .unwrap_or_else(|e| panic!("{} failed to commit apply result: {:?}", tag.as_ref(), e));
+    }
+    if let Some(notifier) = ctx.notifier.take() {
+        let mut region_ids = Vec::with_capacity(ctx.ctxs.len());
+        for apply_ctx in &mut ctx.ctxs {
+            region_ids.push(apply_ctx.region_id);
+        }
+        notifier.send(ApplyFinish { region_ids: region_ids }).unwrap_or_else(|e| {
+            warn!("{} failed to report apply finish, maybe raftstore is stopped: {:?}",
+                  tag.as_ref(),
+                  e);
+        });
+    }
+    for apply_ctx in &mut ctx.ctxs {
+        for (resp, cb) in apply_ctx.cbs.drain(..) {
+            cb(resp);
+        }
+    }
+}
+
 impl<T: Transport, C: PdClient> Store<T, C> {
     pub fn new(ch: StoreChannel,
                meta: metapb::Store,
@@ -151,6 +182,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let sendch = SendCh::new(ch.sender, "raftstore");
         let peer_cache = HashMap::new();
         let tag = format!("[store {}]", meta.get_id());
+        let (tx, rx) = mpsc::channel();
 
         let mut s = Store {
             cfg: cfg,
@@ -167,6 +199,10 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             compact_worker: Worker::new("compact worker"),
             pd_worker: Worker::new("pd worker"),
             consistency_check_worker: Worker::new("consistency check worker"),
+            apply_pool: ThreadPool::new_with_name(thd_name!("apply-pool"),
+                                                  DEFAULT_APPLY_CONCURRENCY),
+            apply_notifier: tx,
+            apply_receiver: Some(rx),
             region_ranges: BTreeMap::new(),
             pending_regions: vec![],
             trans: trans,
@@ -800,28 +836,40 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                   self.raft_metrics.ready.message - previous_ready_metrics.message,
                   self.raft_metrics.ready.snapshot - previous_ready_metrics.snapshot);
 
-        let mut batch_ctx = BatchApplyContext::new();
+        let mut batch_ctx = BatchApplyContext::new(self.apply_receiver.take());
+        let mut sync_write = false;
         for (region_id, ready, res) in ready_results {
             let apply_ctx = ApplyContext::new(region_id, res);
             batch_ctx.ctxs.push(apply_ctx);
-            self.region_peers
-                .get_mut(&region_id)
-                .unwrap()
-                .handle_raft_ready_apply(ready, &mut batch_ctx);
-        }
-
-        let wb = batch_ctx.wb.unwrap();
-        if !wb.is_empty() {
-            // Commit write and change storage fields atomically.
-            self.engine
-                .write(wb)
-                .unwrap_or_else(|e| panic!("{} failed to commit apply result: {:?}", self.tag, e));
-        }
-        for mut apply_ctx in batch_ctx.ctxs {
-            for (resp, cb) in apply_ctx.cbs.drain(..) {
-                cb(resp);
+            {
+                let peer = self.region_peers.get_mut(&region_id).unwrap();
+                peer.handle_raft_ready_apply(ready, &mut batch_ctx);
             }
-            self.on_ready_result(apply_ctx.region_id, apply_ctx);
+            for region_id in batch_ctx.applied_regions.drain(..) {
+                self.region_peers.get_mut(&region_id).unwrap().waiting_apply = false;
+            }
+            // We need to call some post hook, hence we have to sync write to avoid
+            // potential race condition.
+            sync_write = sync_write ||
+                         batch_ctx.ctxs.last().map_or(false, |r| {
+                !r.exec_results.is_empty() || r.apply_snap_result.is_some()
+            });
+        }
+        self.apply_receiver = batch_ctx.receiver.take();
+
+        if sync_write {
+            apply_then_response(&self.tag, &self.engine, &mut batch_ctx);
+            for apply_ctx in batch_ctx.ctxs {
+                self.on_ready_result(apply_ctx.region_id, apply_ctx);
+            }
+        } else {
+            let engine = self.engine.clone();
+            for apply_ctx in &batch_ctx.ctxs {
+                self.region_peers.get_mut(&apply_ctx.region_id).unwrap().waiting_apply = true;
+            }
+            batch_ctx.notifier = Some(self.apply_notifier.clone());
+            let tag = self.tag.clone();
+            self.apply_pool.execute(move || apply_then_response(tag, &engine, &mut batch_ctx));
         }
 
         let dur = t.elapsed();
@@ -845,7 +893,14 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         // TODO: should we check None here?
         // Can we destroy it in another thread later?
         let mut p = self.region_peers.remove(&region_id).unwrap();
-        // We can't destroy a peer which is applying snapshot.
+        // don't destroy a peer unless all async write are flushed.
+        for id in p.flush_apply(self.apply_receiver.as_ref().unwrap()) {
+            if id == region_id {
+                continue;
+            }
+            self.region_peers.get_mut(&id).unwrap().waiting_apply = false;
+        }
+        // We can't destroy a peer which is applying snapshot and committed entries.
         assert!(!p.is_applying());
 
         let is_initialized = p.is_initialized();
@@ -1088,17 +1143,28 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         // command log entry can't be committed.
 
         let region_id = msg.get_header().get_region_id();
-        let mut peer = self.region_peers.get_mut(&region_id).unwrap();
-        let term = peer.term();
-        bind_term(&mut resp, term);
-        let pending_cmd = PendingCmd {
-            uuid: uuid,
-            term: term,
-            cb: Some(cb),
-            renew_lease_time: None,
+        let applied_regions = {
+            let mut peer = self.region_peers.get_mut(&region_id).unwrap();
+            let term = peer.term();
+            bind_term(&mut resp, term);
+            let pending_cmd = PendingCmd {
+                uuid: uuid,
+                term: term,
+                cb: Some(cb),
+                renew_lease_time: None,
+            };
+            let res = peer.propose(pending_cmd,
+                                   msg,
+                                   resp,
+                                   &mut self.raft_metrics.propose,
+                                   self.apply_receiver.as_ref().unwrap());
+            if res.0 {
+                self.pending_raft_groups.insert(region_id);
+            }
+            res.1
         };
-        if peer.propose(pending_cmd, msg, resp, &mut self.raft_metrics.propose) {
-            self.pending_raft_groups.insert(region_id);
+        for region_id in applied_regions {
+            self.region_peers.get_mut(&region_id).unwrap().waiting_apply = false;
         }
 
         // TODO: add timeout, if the command is not applied after timeout,
