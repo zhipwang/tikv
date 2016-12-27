@@ -768,46 +768,15 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             (ctx.wb, ctx.ready_res)
         };
 
-        if !wb.is_empty() {
-            self.engine.write(wb).unwrap_or_else(|e| {
-                panic!("{} failed to save append result: {:?}", self.tag, e);
-            });
-        }
-
-        let mut ready_results = Vec::with_capacity(append_res.len());
-        for (mut ready, invoke_ctx) in append_res {
-            let region_id = invoke_ctx.region_id;
-            let res = self.region_peers
-                .get_mut(&region_id)
-                .unwrap()
-                .post_raft_ready_append(&mut self.raft_metrics,
-                                        &self.trans,
-                                        &mut ready,
-                                        invoke_ctx);
-            ready_results.push((region_id, ready, res));
-        }
-
-        let sent_snapshot_count = self.raft_metrics.message.snapshot - previous_sent_snapshot_count;
-        self.sent_snapshot_count += sent_snapshot_count;
-
-        slow_log!(t,
-                  "{} handle {} pending peers include {} ready, {} entries, {} messages and {} \
-                   snapshots",
-                  self.tag,
-                  pending_count,
-                  ready_results.capacity(),
-                  self.raft_metrics.ready.append - previous_ready_metrics.append,
-                  self.raft_metrics.ready.message - previous_ready_metrics.message,
-                  self.raft_metrics.ready.snapshot - previous_ready_metrics.snapshot);
-
-        let mut batch_ctx = BatchApplyContext::new();
-        for (region_id, ready, res) in ready_results {
+        let mut batch_ctx = BatchApplyContext::new(wb, append_res.len());
+        for (region_id, mut ready, res) in append_res {
             let apply_ctx = ApplyContext::new(region_id, res);
             batch_ctx.ctxs.push(apply_ctx);
             self.region_peers
                 .get_mut(&region_id)
                 .unwrap()
-                .handle_raft_ready_apply(ready, &mut batch_ctx);
+                .handle_raft_ready_apply(&mut ready, &mut batch_ctx);
+            batch_ctx.ctxs.last_mut().unwrap().ready = Some(ready);
         }
 
         let wb = batch_ctx.wb.unwrap();
@@ -817,12 +786,34 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 .write(wb)
                 .unwrap_or_else(|e| panic!("{} failed to commit apply result: {:?}", self.tag, e));
         }
-        for mut apply_ctx in batch_ctx.ctxs {
+        for mut apply_ctx in &mut batch_ctx.ctxs {
             for (resp, cb) in apply_ctx.cbs.drain(..) {
                 cb(resp);
             }
             self.on_ready_result(apply_ctx.region_id, apply_ctx);
         }
+
+        for apply_ctx in &mut batch_ctx.ctxs {
+            // it might be removed already.
+            if let Some(p) = self.region_peers.get_mut(&apply_ctx.region_id) {
+                p.commit_raft_ready(&mut self.raft_metrics,
+                                    &self.trans,
+                                    apply_ctx.ready.take().unwrap(),
+                                    &apply_ctx.apply_snap_result);
+            }
+        }
+
+        let sent_snapshot_count = self.raft_metrics.message.snapshot - previous_sent_snapshot_count;
+        self.sent_snapshot_count += sent_snapshot_count;
+
+        slow_log!(t,
+                  "{} handle {} pending peers include {} entries, {} messages and {} \
+                   snapshots",
+                  self.tag,
+                  pending_count,
+                  self.raft_metrics.ready.append - previous_ready_metrics.append,
+                  self.raft_metrics.ready.message - previous_ready_metrics.message,
+                  self.raft_metrics.ready.snapshot - previous_ready_metrics.snapshot);
 
         let dur = t.elapsed();
         if !self.is_busy {
@@ -992,9 +983,9 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         }
     }
 
-    fn on_ready_apply_snapshot(&mut self, apply_result: ApplySnapResult) {
-        let prev_region = apply_result.prev_region;
-        let region = apply_result.region;
+    fn on_ready_apply_snapshot(&mut self, apply_result: &ApplySnapResult) {
+        let prev_region = apply_result.prev_region.clone();
+        let region = apply_result.region.clone();
         let region_id = region.get_id();
 
         info!("[region {}] snapshot for region {:?} is applied",
@@ -1017,15 +1008,15 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         self.region_ranges.insert(enc_end_key(&region), region.get_id());
     }
 
-    fn on_ready_result(&mut self, region_id: u64, ready_result: ApplyContext) {
-        if let Some(apply_result) = ready_result.apply_snap_result {
+    fn on_ready_result(&mut self, region_id: u64, ready_result: &mut ApplyContext) {
+        if let Some(ref apply_result) = ready_result.apply_snap_result {
             self.on_ready_apply_snapshot(apply_result);
         }
 
         let t = SlowTimer::new();
         let result_count = ready_result.exec_results.len();
         // handle executing committed log results
-        for result in ready_result.exec_results {
+        for result in ready_result.exec_results.drain(..) {
             match result {
                 ExecResult::ChangePeer { change_type, peer, .. } => {
                     self.on_ready_change_peer(region_id, change_type, peer)
