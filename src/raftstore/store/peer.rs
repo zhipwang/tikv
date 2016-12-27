@@ -39,8 +39,7 @@ use util::{escape, SlowTimer, rocksdb, clocktime};
 use pd::{PdClient, INVALID_ID};
 use storage::{CF_LOCK, CF_RAFT};
 use super::store::Store;
-use super::peer_storage::{PeerStorage, ApplySnapResult, write_initial_state, write_peer_state,
-                          InvokeContext};
+use super::peer_storage::{PeerStorage, ApplySnapResult, write_initial_state, write_peer_state};
 use super::util;
 use super::msg::Callback;
 use super::cmd_resp;
@@ -110,7 +109,7 @@ pub struct ReadyContext<'a, T: 'a> {
     pub wb: WriteBatch,
     pub metrics: &'a mut RaftMetrics,
     pub trans: &'a T,
-    pub ready_res: Vec<(Ready, InvokeContext)>,
+    pub ready_res: Vec<(u64, Ready, Option<ApplySnapResult>)>,
 }
 
 impl<'a, T> ReadyContext<'a, T> {
@@ -129,15 +128,17 @@ impl<'a, T> ReadyContext<'a, T> {
 /// the assumption is safe as long as `TiKV` panics when `WriteBatch` fails to be written to disk
 /// and there is no other iteraction with outside world.
 pub struct BatchApplyContext {
+    pub wait_append: bool,
     pub wb: Option<WriteBatch>,
     pub ctxs: Vec<ApplyContext>,
 }
 
 impl BatchApplyContext {
-    pub fn new() -> BatchApplyContext {
+    pub fn new(cap: usize) -> BatchApplyContext {
         BatchApplyContext {
+            wait_append: false,
             wb: Some(WriteBatch::new()),
-            ctxs: vec![],
+            ctxs: Vec::with_capacity(cap),
         }
     }
 }
@@ -147,6 +148,7 @@ pub struct ApplyContext {
     // We can execute multi commands like 1, conf change, 2 split region, ...
     // in one ready, and outer store should handle these results sequentially too.
     pub exec_results: Vec<ExecResult>,
+    pub ready: Option<Ready>,
     // apply_snap_result is set after snapshot applied.
     pub apply_snap_result: Option<ApplySnapResult>,
 
@@ -158,6 +160,7 @@ impl ApplyContext {
         ApplyContext {
             region_id: region_id,
             exec_results: vec![],
+            ready: None,
             apply_snap_result: apply_snap_result,
             cbs: vec![],
         }
@@ -678,21 +681,19 @@ impl Peer {
         };
         append_timer.observe_duration();
 
-        ctx.ready_res.push((ready, invoke_ctx));
+        ctx.ready_res.push((self.region_id, ready, invoke_ctx));
     }
 
-    pub fn post_raft_ready_append<T: Transport>(&mut self,
-                                                metrics: &mut RaftMetrics,
-                                                trans: &T,
-                                                ready: &mut Ready,
-                                                invoke_ctx: InvokeContext)
-                                                -> Option<ApplySnapResult> {
-        if invoke_ctx.has_snapshot() {
+    pub fn commit_raft_ready<T: Transport>(&mut self,
+                                           metrics: &mut RaftMetrics,
+                                           trans: &T,
+                                           mut ready: Ready,
+                                           res: &Option<ApplySnapResult>) {
+        if let Some(ref res) = *res {
             // When apply snapshot, there is no log applied and not compacted yet.
             self.raft_log_size_hint = 0;
+            self.mut_store().post_ready(&res.prev_region);
         }
-
-        let apply_snap_result = self.mut_store().post_ready(invoke_ctx);
 
         if !self.is_leader() {
             self.send(trans, ready.messages.drain(..), &mut metrics.message).unwrap_or_else(|e| {
@@ -700,10 +701,10 @@ impl Peer {
             });
         }
 
-        apply_snap_result
+        self.raft_group.advance(ready);
     }
 
-    pub fn handle_raft_ready_apply(&mut self, mut ready: Ready, ctx: &mut BatchApplyContext) {
+    pub fn handle_raft_ready_apply(&mut self, mut ready: &mut Ready, ctx: &mut BatchApplyContext) {
         // Call `handle_raft_commit_entries` directly here may lead to inconsistency.
         // In some cases, there will be some pending committed entries when applying a
         // snapshot. If we call `handle_raft_commit_entries` directly, these updates
@@ -712,15 +713,13 @@ impl Peer {
         // in memory. Hence when handle ready next time, these updates won't be included
         // in `ready.committed_entries` again, which will lead to inconsistency.
         if self.is_applying() {
-            if let Some(ref mut hs) = ready.hs {
+            if let Some(ref mut hs) = (*ready).hs {
                 // Snapshot's metadata has been applied.
                 hs.set_commit(self.get_store().truncated_index());
             }
         } else {
             self.handle_raft_commit_entries(&ready.committed_entries, ctx)
         }
-
-        self.raft_group.advance(ready);
     }
 
     /// Propose a request.
@@ -1405,6 +1404,9 @@ impl Peer {
             match *exec_result {
                 ExecResult::ChangePeer { ref region, .. } => {
                     storage.region = region.clone();
+                    if self.pending_remove {
+                        ctx.wait_append = true;
+                    }
                 }
                 ExecResult::ComputeHash { .. } |
                 ExecResult::VerifyHash { .. } => {}
@@ -1416,6 +1418,7 @@ impl Peer {
                 }
                 ExecResult::SplitRegion { ref left, .. } => {
                     storage.region = left.clone();
+                    ctx.wait_append = true;
                 }
             }
         }

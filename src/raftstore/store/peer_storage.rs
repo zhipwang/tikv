@@ -757,7 +757,7 @@ impl PeerStorage {
     pub fn handle_raft_ready<T>(&mut self,
                                 ready_ctx: &mut ReadyContext<T>,
                                 ready: &Ready)
-                                -> Result<InvokeContext> {
+                                -> Result<Option<ApplySnapResult>> {
         let mut ctx = InvokeContext::new(self);
         if !raft::is_empty_snap(&ready.snapshot) {
             try!(self.apply_snapshot(&mut ctx, &ready.snapshot, &mut ready_ctx.wb));
@@ -783,22 +783,29 @@ impl PeerStorage {
             try!(ctx.save_apply_to(&self.engine, &mut ready_ctx.wb));
         }
 
-        Ok(ctx)
-    }
-
-    /// Update the memory state after ready changes are flushed to disk successfully.
-    pub fn post_ready(&mut self, ctx: InvokeContext) -> Option<ApplySnapResult> {
         self.raft_state = ctx.raft_state;
         self.apply_state = ctx.apply_state;
         self.last_term = ctx.last_term;
         // If we apply snapshot ok, we should update some infos like applied index too.
         let snap_region = match ctx.snap_region {
             Some(r) => r,
-            None => return None,
+            None => return Ok(None),
         };
+
+        let prev_region = self.region.clone();
+        self.region = snap_region;
+
+        Ok(Some(ApplySnapResult {
+            prev_region: prev_region,
+            region: self.region.clone(),
+        }))
+    }
+
+    /// Update the memory state after ready changes are flushed to disk successfully.
+    pub fn post_ready(&mut self, prev_region: &Region) {
         // cleanup data before scheduling apply task
-        if self.is_initialized() {
-            if let Err(e) = self.clear_extra_data(&self.region) {
+        if !prev_region.get_peers().is_empty() {
+            if let Err(e) = self.clear_extra_data(prev_region) {
                 // No need panic here, when applying snapshot, the deletion will be tried
                 // again. But if the region range changes, like [a, c) -> [a, b) and [b, c),
                 // [b, c) will be kept in rocksdb until a covered snapshot is applied or
@@ -810,13 +817,6 @@ impl PeerStorage {
         }
 
         self.schedule_applying_snapshot();
-        let prev_region = self.region.clone();
-        self.region = snap_region;
-
-        Some(ApplySnapResult {
-            prev_region: prev_region,
-            region: self.region.clone(),
-        })
     }
 }
 
