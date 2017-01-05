@@ -58,6 +58,9 @@ url = "1.2"
 getopts = "0.2"
 regex = "0.1"
 
+[replace]
+"protobuf:1.0.24" = { git = 'https://github.com/busyjay/rust-protobuf.git', branch = 'busyjay/opt-is' }
+
 [dependencies.rocksdb]
 git = "https://github.com/siddontang/rust-rocksdb.git"
 branch = "siddontang/rocksdb-5"
@@ -68,12 +71,14 @@ branch = "busyjay/compact-term"
 
 [dependencies.tipb]
 git = "https://github.com/pingcap/tipb.git"
+branch = "busyjay/opt-is"
 
 [dependencies.mio]
 git = "https://github.com/carllerche/mio.git"
 
 [dependencies.prometheus]
 git = "https://github.com/pingcap/rust-prometheus.git"
+branch = "busyjay/opt-is"
 default-features = false
 features = ["nightly", "push"]
 

@@ -16,7 +16,7 @@ use std::io::Read;
 
 use mio::{Token, EventLoop, EventSet, PollOpt};
 use mio::tcp::TcpStream;
-use protobuf::Message as PbMessage;
+use protobuf::CodedMessage;
 
 use kvproto::msgpb::Message;
 use kvproto::raft_serverpb::RaftSnapshotData;

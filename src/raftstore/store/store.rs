@@ -23,7 +23,7 @@ use std::{cmp, u64};
 
 use rocksdb::DB;
 use mio::{self, EventLoop, EventLoopBuilder, Sender};
-use protobuf;
+use protobuf::{self, Message, CodedMessage};
 use fs2;
 use uuid::Uuid;
 use time::{self, Timespec};
@@ -36,7 +36,6 @@ use util::{HandyRwLock, SlowTimer, duration_to_nanos, escape};
 use pd::PdClient;
 use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, StatusCmdType, StatusResponse,
                           RaftCmdRequest, RaftCmdResponse};
-use protobuf::Message;
 use raft::{SnapshotStatus, INVALID_INDEX};
 use raftstore::{Result, Error};
 use kvproto::metapb;

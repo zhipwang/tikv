@@ -22,7 +22,7 @@ use std::io::{self, BufRead};
 use std::vec::Vec;
 
 use byteorder::{ByteOrder, BigEndian, ReadBytesExt};
-use protobuf::{self, CodedInputStream};
+use protobuf::{CodedMessage, CodedInputStream};
 
 use super::{Result, Error};
 
@@ -37,7 +37,7 @@ fn other_err(msg: String) -> Error {
 
 
 // Encodes message with message ID and protobuf body.
-pub fn encode_msg<T: io::Write, M: protobuf::Message + ?Sized>(w: &mut T,
+pub fn encode_msg<T: io::Write, M: CodedMessage + ?Sized>(w: &mut T,
                                                                msg_id: u64,
                                                                msg: &M)
                                                                -> Result<()> {
@@ -50,7 +50,7 @@ pub fn encode_msg<T: io::Write, M: protobuf::Message + ?Sized>(w: &mut T,
 }
 
 // Decodes encoded message, returns message ID.
-pub fn decode_msg<T: io::Read, M: protobuf::Message>(r: &mut T, m: &mut M) -> Result<u64> {
+pub fn decode_msg<T: io::Read, M: CodedMessage>(r: &mut T, m: &mut M) -> Result<u64> {
     let (message_id, payload) = try!(decode_data(r));
     let mut reader = payload.as_slice();
     try!(decode_body(&mut reader, m));
@@ -115,7 +115,7 @@ pub fn decode_msg_header<R: io::Read>(header: &mut R) -> Result<(u64, usize)> {
 }
 
 // Decodes only body.
-pub fn decode_body<R: BufRead, M: protobuf::Message>(payload: &mut R, m: &mut M) -> Result<()> {
+pub fn decode_body<R: BufRead, M: CodedMessage>(payload: &mut R, m: &mut M) -> Result<()> {
     let mut is = CodedInputStream::from_buffered_reader(payload);
     try!(m.merge_from(&mut is));
     Ok(())

@@ -23,7 +23,7 @@ use std::fmt::{self, Display, Formatter, Debug};
 use tipb::select::{self, SelectRequest, SelectResponse, Chunk, RowMeta};
 use tipb::schema::ColumnInfo;
 use tipb::expression::{Expr, ExprType};
-use protobuf::{Message as PbMsg, RepeatedField};
+use protobuf::{Message as PbMsg, RepeatedField, CodedMessage};
 use byteorder::{BigEndian, ReadBytesExt};
 use threadpool::ThreadPool;
 use kvproto::msgpb::{MessageType, Message};

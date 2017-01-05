@@ -19,7 +19,7 @@ use std::error;
 use std::time::Instant;
 
 use rocksdb::{DB, WriteBatch, Writable};
-use protobuf::Message;
+use protobuf::{Message, CodedMessage};
 
 use kvproto::metapb::{self, Region};
 use kvproto::eraftpb::{Entry, Snapshot, ConfState, HardState};
@@ -1186,7 +1186,7 @@ mod test {
         assert!(!snap.get_data().is_empty());
 
         let mut data = RaftSnapshotData::new();
-        protobuf::Message::merge_from_bytes(&mut data, snap.get_data()).expect("");
+        protobuf::CodedMessage::merge_from_bytes(&mut data, snap.get_data()).expect("");
         assert_eq!(data.get_region().get_id(), 1);
         assert_eq!(data.get_region().get_peers().len(), 1);
 

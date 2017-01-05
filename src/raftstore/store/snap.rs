@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crc::crc32::{self, Digest, Hasher32};
 use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
-use protobuf::Message;
+use protobuf::CodedMessage;
 
 use kvproto::eraftpb::Snapshot;
 use kvproto::raft_serverpb::RaftSnapshotData;

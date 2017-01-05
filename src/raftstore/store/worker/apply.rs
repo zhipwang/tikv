@@ -21,7 +21,7 @@ use std::vec::Vec;
 use std::default::Default;
 
 use rocksdb::{DB, WriteBatch, Writable};
-use protobuf::{self, Message, MessageStatic};
+use protobuf::{self, Message, CodedMessage, MessageStatic};
 use uuid::Uuid;
 
 use kvproto::metapb::{Peer, Region};
@@ -287,13 +287,15 @@ pub enum ExecResult {
 // TODO: make sure received entries are not corrupted
 // If this happens, TiKV will panic and can't recover without extra effort.
 #[inline]
-fn parse_data_at<T: Message + MessageStatic>(data: &[u8], index: u64, region_id: u64) -> T {
-    protobuf::parse_from_bytes::<T>(data).unwrap_or_else(|e| {
+fn parse_data_at<T: CodedMessage + MessageStatic>(data: &[u8], index: u64, region_id: u64) -> T {
+    let mut t = T::new();
+    t.merge_from_bytes(data).unwrap_or_else(|e| {
         panic!("[region {}] data is corrupted at {}: {:?}",
                region_id,
                index,
                e);
-    })
+    });
+    t
 }
 
 struct ExecContext<'a> {

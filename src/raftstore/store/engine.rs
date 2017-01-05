@@ -17,7 +17,7 @@ use std::fmt::{self, Debug, Formatter};
 
 use rocksdb::{DB, Writable, DBIterator, DBVector, WriteBatch, ReadOptions, CFHandle};
 use rocksdb::rocksdb_options::UnsafeSnap;
-use protobuf;
+use protobuf::{Message, CodedMessage, MessageStatic};
 use byteorder::{ByteOrder, BigEndian};
 use util::rocksdb;
 
@@ -72,7 +72,7 @@ pub trait Peekable {
     fn get_value_cf(&self, cf: &str, key: &[u8]) -> Result<Option<DBVector>>;
 
     fn get_msg<M>(&self, key: &[u8]) -> Result<Option<M>>
-        where M: protobuf::Message + protobuf::MessageStatic
+        where M: CodedMessage + MessageStatic
     {
         let value = try!(self.get_value(key));
 
@@ -86,7 +86,7 @@ pub trait Peekable {
     }
 
     fn get_msg_cf<M>(&self, cf: &str, key: &[u8]) -> Result<Option<M>>
-        where M: protobuf::Message + protobuf::MessageStatic
+        where M: CodedMessage + MessageStatic
     {
         let value = try!(self.get_value_cf(cf, key));
 
@@ -273,13 +273,13 @@ impl Iterable for Snapshot {
 }
 
 pub trait Mutable: Writable {
-    fn put_msg<M: protobuf::Message>(&self, key: &[u8], m: &M) -> Result<()> {
+    fn put_msg<M: Message>(&self, key: &[u8], m: &M) -> Result<()> {
         let value = try!(m.write_to_bytes());
         try!(self.put(key, &value));
         Ok(())
     }
 
-    fn put_msg_cf<M: protobuf::Message>(&self, cf: &CFHandle, key: &[u8], m: &M) -> Result<()> {
+    fn put_msg_cf<M: Message>(&self, cf: &CFHandle, key: &[u8], m: &M) -> Result<()> {
         let value = try!(m.write_to_bytes());
         try!(self.put_cf(cf, key, &value));
         Ok(())

@@ -21,7 +21,7 @@ use std::time::{Instant, Duration};
 use time::{Timespec, Duration as TimeDuration};
 
 use rocksdb::{DB, WriteBatch};
-use protobuf::Message;
+use protobuf::{Message, CodedMessage};
 use uuid::Uuid;
 
 use kvproto::metapb;

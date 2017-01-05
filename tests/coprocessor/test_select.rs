@@ -17,7 +17,7 @@ use std::collections::{HashMap, BTreeMap};
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::i64;
-use protobuf::{RepeatedField, Message};
+use protobuf::{RepeatedField, Message, CodedMessage};
 
 static ID_GENERATOR: AtomicUsize = AtomicUsize::new(1);
 

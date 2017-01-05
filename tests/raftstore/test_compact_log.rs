@@ -26,7 +26,7 @@ use super::node::new_node_cluster;
 use super::server::new_server_cluster;
 
 fn get_msg_cf_or_default<M>(engine: &DB, cf: &str, key: &[u8]) -> M
-    where M: protobuf::Message + protobuf::MessageStatic
+    where M: protobuf::CodedMessage + protobuf::MessageStatic
 {
     engine.get_msg_cf(cf, key).unwrap().unwrap_or_default()
 }

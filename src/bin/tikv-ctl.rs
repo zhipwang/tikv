@@ -23,7 +23,7 @@ extern crate tempdir;
 
 use std::{str, u64};
 use clap::{Arg, App, SubCommand};
-use protobuf::Message;
+use protobuf::CodedMessage;
 use kvproto::raft_cmdpb::RaftCmdRequest;
 use kvproto::raft_serverpb::{RaftLocalState, RegionLocalState, RaftApplyState, PeerState};
 use kvproto::eraftpb::Entry;
