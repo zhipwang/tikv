@@ -467,6 +467,8 @@ impl Peer {
             match msg_type {
                 MessageType::MsgAppend => metrics.append += 1,
                 MessageType::MsgAppendResponse => metrics.append_resp += 1,
+                MessageType::MsgRequestPreVote => metrics.pre_vote += 1,
+                MessageType::MsgRequestPreVoteResponse => metrics.pre_vote_resp += 1,
                 MessageType::MsgRequestVote => metrics.vote += 1,
                 MessageType::MsgRequestVoteResponse => metrics.vote_resp += 1,
                 MessageType::MsgSnapshot => metrics.snapshot += 1,
