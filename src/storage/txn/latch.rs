@@ -17,82 +17,126 @@
 use std::collections::VecDeque;
 use std::hash::{Hash, SipHasher as DefaultHasher, Hasher};
 use std::usize;
+use std::rc::Rc;
+use std::cell::RefCell;
 
-/// Latch which is used to serialize accesses to resources hashed to the same slot.
-///
-/// Latches are indexed by slot IDs. The keys of a command are hashed to slot IDs, then the command
-/// is added to the waiting queues of the latches.
-///
-/// If command A is ahead of command B in one latch, it must be ahead of command B in all the
-/// overlapping latches. This is an invariant ensured by the `gen_lock`, `acquire` and `release`.
+use futures::{Future, Poll, Async};
+use futures::task::{self, Task};
+
+use storage::Error;
+
+
 #[derive(Clone)]
-struct Latch {
-    // store waiting commands
-    pub waiting: VecDeque<u64>,
+struct Holder {
+    lock_id: u32,
+    task: Option<Task>,
 }
 
-impl Latch {
-    /// Creates a latch with an empty waiting queue.
-    pub fn new() -> Latch {
-        Latch { waiting: VecDeque::new() }
+impl Holder {
+    fn new(lock_id: u32) -> Holder {
+        Holder {
+            lock_id: lock_id,
+            task: None,
+        }
+    }
+
+    fn with_task(mut self, task: Task) -> Holder {
+        self.task = Some(task);
+        self
+    }
+}
+
+pub struct LockInner {
+    /// The slot IDs of the latches that a command must acquire before being able to be processed.
+    required_slots: Vec<usize>,
+    id: u32,
+    inner: Rc<RefCell<Inner>>,
+}
+
+impl Drop for LockInner {
+    fn drop(&mut self) {
+        for &idx in &self.required_slots {
+            let mut inner = self.inner.borrow_mut();
+            let queue = &mut inner.slots[idx];
+            let front = queue.pop_front().unwrap();
+            assert_eq!(front.lock_id, self.id);
+            if let Some(next) = queue.front() {
+                next.task.as_ref().unwrap().unpark();
+            }
+        }
     }
 }
 
 /// Lock required for a command.
-#[derive(Clone)]
-pub struct Lock {
-    /// The slot IDs of the latches that a command must acquire before being able to be processed.
-    pub required_slots: Vec<usize>,
+pub struct AsyncLock {
+    lock: Option<LockInner>,
 
     /// The number of latches that the command has acquired.
     pub owned_count: usize,
 }
 
-impl Lock {
-    /// Creates a lock.
-    pub fn new(required_slots: Vec<usize>) -> Lock {
-        Lock {
-            required_slots: required_slots,
-            owned_count: 0,
-        }
-    }
+impl Future for AsyncLock {
+    type Item = LockInner;
+    type Error = Error;
 
-    /// Returns true if all the required latches have be acquired, false otherwise.
-    pub fn acquired(&self) -> bool {
-        self.required_slots.len() == self.owned_count
+    fn poll(&mut self) -> Poll<LockInner, Error> {
+        if self.lock.is_none() {
+            panic!("can't poll lock after ready!!!");
+        }
+
+        let lock = self.lock.take().unwrap();
+        let require_len = lock.required_slots.len();
+        if require_len > self.owned_count {
+            let mut inner = lock.inner.borrow_mut();
+            while require_len > self.owned_count {
+                let l = lock.required_slots[self.owned_count];
+                let queue = &mut inner.slots[l];
+                if queue.is_empty() {
+                    queue.push_back(Holder::new(lock.id));
+                } else if queue.front().unwrap().lock_id != lock.id {
+                    queue.push_back(Holder::new(lock.id).with_task(task::park()));
+                    break;
+                }
+                self.owned_count += 1;
+            }
+        }
+
+        Ok(if require_len == self.owned_count {
+            Async::Ready(lock)
+        } else {
+            self.lock = Some(lock);
+            Async::NotReady
+        })
     }
+}
+
+struct Inner {
+    slots: Vec<VecDeque<Holder>>,
+    size: usize,
 }
 
 /// Latches which are used for concurrency control in the scheduler.
 ///
 /// Each latch is indexed by a slot ID, hence the term latch and slot are used interchangably, but
 /// conceptually a latch is a queue, and a slot is an index to the queue.
-pub struct Latches {
-    slots: Vec<Latch>,
-    size: usize,
+pub struct AsyncLatches {
+    allocated_id: u32,
+    inner: Rc<RefCell<Inner>>,
 }
 
-impl Latches {
+impl AsyncLatches {
     /// Creates latches.
     ///
     /// The size will be rounded up to the power of 2.
-    pub fn new(size: usize) -> Latches {
+    pub fn new(size: usize) -> AsyncLatches {
         let power_of_two_size = usize::next_power_of_two(size);
-        Latches {
-            slots: vec![Latch::new(); power_of_two_size],
-            size: power_of_two_size,
+        AsyncLatches {
+            allocated_id: 0,
+            inner: Rc::new(RefCell::new(Inner {
+                slots: vec![VecDeque::new(); power_of_two_size],
+                size: power_of_two_size,
+            })),
         }
-    }
-
-    /// Creates a lock which specifies all the required latches for a command.
-    pub fn gen_lock<H>(&self, keys: &[H]) -> Lock
-        where H: Hash
-    {
-        // prevent from deadlock, so we sort and deduplicate the index
-        let mut slots: Vec<usize> = keys.iter().map(|x| self.calc_slot(x)).collect();
-        slots.sort();
-        slots.dedup();
-        Lock::new(slots)
     }
 
     /// Tries to acquire the latches specified by the `lock` for command with ID `who`.
@@ -100,132 +144,149 @@ impl Latches {
     /// This method will enqueue the command ID into the waiting queues of the latches. A latch is
     /// considered acquired if the command ID is at the front of the queue. Returns true if all the
     /// Latches are acquired, false otherwise.
-    pub fn acquire(&mut self, lock: &mut Lock, who: u64) -> bool {
-        let mut acquired_count: usize = 0;
-        for i in &lock.required_slots[lock.owned_count..] {
-            let latch = &mut self.slots[*i];
-
-            let front = latch.waiting.front().cloned();
-            match front {
-                Some(cid) => {
-                    if cid == who {
-                        acquired_count += 1;
-                    } else {
-                        latch.waiting.push_back(who);
-                        break;
-                    }
-                }
-                None => {
-                    latch.waiting.push_back(who);
-                    acquired_count += 1;
-                }
-            }
-        }
-
-        lock.owned_count += acquired_count;
-        lock.acquired()
-    }
-
-    /// Releases all latches owned by the `lock` of command with ID `who`, returns the wakeup list.
-    ///
-    /// Preconditions: the caller must ensure the command is at the front of the latches.
-    pub fn release(&mut self, lock: &Lock, who: u64) -> Vec<u64> {
-        let mut wakeup_list: Vec<u64> = vec![];
-        for i in &lock.required_slots[..lock.owned_count] {
-            let latch = &mut self.slots[*i];
-            let front = latch.waiting.pop_front().unwrap();
-            assert_eq!(front, who);
-
-            if let Some(wakeup) = latch.waiting.front() {
-                wakeup_list.push(*wakeup);
-            }
-        }
-        wakeup_list
-    }
-
-    /// Calculates the slot ID by hashing the `key`.
-    fn calc_slot<H>(&self, key: &H) -> usize
+    pub fn acquire<H>(&mut self, keys: &[H]) -> AsyncLock
         where H: Hash
     {
-        let mut s = DefaultHasher::new();
-        key.hash(&mut s);
-        (s.finish() as usize) & (self.size - 1)
+        // prevent from deadlock, so we sort and deduplicate the index
+        let mut slots: Vec<usize> = keys.iter()
+            .map(|key| {
+                let mut s = DefaultHasher::new();
+                key.hash(&mut s);
+                (s.finish() as usize) & (self.inner.borrow().size - 1)
+            })
+            .collect();
+        slots.sort();
+        slots.dedup();
+        self.allocated_id += 1;
+
+        AsyncLock {
+            lock: Some(LockInner {
+                required_slots: slots,
+                id: self.allocated_id,
+                inner: self.inner.clone(),
+            }),
+            owned_count: 0,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Latches, Lock};
+    use std::sync::Arc;
+    use std::sync::atomic::*;
+    use futures::*;
+    use futures::executor::Unpark;
+    use super::AsyncLatches;
+
+    // An Unpark struct that records unpark events for inspection
+    struct WakeupTimes(AtomicUsize);
+
+    impl WakeupTimes {
+        fn new() -> Arc<WakeupTimes> {
+            Arc::new(WakeupTimes(AtomicUsize::new(0)))
+        }
+
+        fn get(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Unpark for WakeupTimes {
+        fn unpark(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    macro_rules! assert_ready {
+        ($e:expr) => ({
+            match $e {
+                Ok(Async::Ready(t)) => t,
+                Ok(Async::NotReady) => panic!("still not ready."),
+                Err(e) => panic!("failed to poll {:?}", e),
+            }
+        })
+    }
+
+    macro_rules! assert_waiting {
+        ($e:expr) => ({
+            match $e {
+                Ok(Async::Ready(t)) => panic!("should not ready"),
+                Ok(Async::NotReady) => {},
+                Err(e) => panic!("failed to poll {:?}", e),
+            }
+        })
+    }
 
     #[test]
     fn test_wakeup() {
-        let mut latches = Latches::new(256);
+        let mut latches = AsyncLatches::new(256);
 
-        let slots_a: Vec<usize> = vec![1, 3, 5];
-        let mut lock_a = Lock::new(slots_a);
-        let slots_b: Vec<usize> = vec![4, 5, 6];
-        let mut lock_b = Lock::new(slots_b);
-        let cid_a: u64 = 1;
-        let cid_b: u64 = 2;
+        let slots_a = vec![1, 3, 5];
+        let mut lock_a = latches.acquire(&slots_a);
+        let mut t_a = executor::spawn(lock_a);
+        let slots_b = vec![4, 5, 6];
+        let mut lock_b = latches.acquire(&slots_b);
+        let mut t_b = executor::spawn(lock_b);
 
-        // a acquire lock success
-        let acquired_a = latches.acquire(&mut lock_a, cid_a);
-        assert_eq!(acquired_a, true);
+        let f_a = WakeupTimes::new();
+        let inner = assert_ready!(t_a.poll_future(f_a.clone()));
+        assert_eq!(0, f_a.get());
 
-        // b acquire lock failed
-        let mut acquired_b = latches.acquire(&mut lock_b, cid_b);
-        assert_eq!(acquired_b, false);
+        let f_b = WakeupTimes::new();
+        assert_waiting!(t_b.poll_future(f_b.clone()));
+        assert_eq!(0, f_a.get());
+        assert_eq!(0, f_b.get());
+        drop(inner);
+        assert_eq!(0, f_a.get());
+        assert_eq!(1, f_b.get());
+        assert_ready!(t_b.poll_future(f_b.clone()));
+        assert_eq!(1, f_b.get());
 
-        // a release lock, and get wakeup list
-        let wakeup = latches.release(&lock_a, cid_a);
-        assert_eq!(wakeup[0], cid_b);
+        lock_a = latches.acquire(&slots_a);
+        t_a = executor::spawn(lock_a);
+        lock_b = latches.acquire(&slots_b);
+        t_b = executor::spawn(lock_b);
 
-        // b acquire lock success
-        acquired_b = latches.acquire(&mut lock_b, cid_b);
-        assert_eq!(acquired_b, true);
+        let f_a = WakeupTimes::new();
+        let inner = assert_ready!(t_a.poll_future(f_a.clone()));
+        assert_eq!(0, f_a.get());
+        drop(inner);
+        assert_eq!(0, f_a.get());
+        let f_b = WakeupTimes::new();
+        assert_ready!(t_b.poll_future(f_b.clone()));
+        assert_eq!(0, f_b.get());
     }
 
     #[test]
     fn test_wakeup_by_multi_cmds() {
-        let mut latches = Latches::new(256);
+        let mut latches = AsyncLatches::new(256);
 
         let slots_a: Vec<usize> = vec![1, 2, 3];
         let slots_b: Vec<usize> = vec![4, 5, 6];
         let slots_c: Vec<usize> = vec![3, 4];
-        let mut lock_a = Lock::new(slots_a);
-        let mut lock_b = Lock::new(slots_b);
-        let mut lock_c = Lock::new(slots_c);
-        let cid_a: u64 = 1;
-        let cid_b: u64 = 2;
-        let cid_c: u64 = 3;
 
-        // a acquire lock success
-        let acquired_a = latches.acquire(&mut lock_a, cid_a);
-        assert_eq!(acquired_a, true);
+        let lock_a = latches.acquire(&slots_a);
+        let mut t_a = executor::spawn(lock_a);
+        let lock_b = latches.acquire(&slots_b);
+        let mut t_b = executor::spawn(lock_b);
+        let lock_c = latches.acquire(&slots_c);
+        let mut t_c = executor::spawn(lock_c);
 
-        // b acquire lock success
-        let acquired_b = latches.acquire(&mut lock_b, cid_b);
-        assert_eq!(acquired_b, true);
+        let wake_a = WakeupTimes::new();
+        let inner_a = assert_ready!(t_a.poll_future(wake_a.clone()));
 
-        // c acquire lock failed, cause a occupied slot 3
-        let mut acquired_c = latches.acquire(&mut lock_c, cid_c);
-        assert_eq!(acquired_c, false);
+        let wake_b = WakeupTimes::new();
+        let inner_b = assert_ready!(t_b.poll_future(wake_b.clone()));
 
-        // a release lock, and get wakeup list
-        let wakeup = latches.release(&lock_a, cid_a);
-        assert_eq!(wakeup[0], cid_c);
+        let wake_c = WakeupTimes::new();
+        assert_waiting!(t_c.poll_future(wake_c.clone()));
 
-        // c acquire lock failed again, cause b occupied slot 4
-        acquired_c = latches.acquire(&mut lock_c, cid_c);
-        assert_eq!(acquired_c, false);
+        drop(inner_b);
+        assert_eq!(wake_c.get(), 1);
+        assert_waiting!(t_c.poll_future(wake_c.clone()));
 
-        // b release lock, and get wakeup list
-        let wakeup = latches.release(&lock_b, cid_b);
-        assert_eq!(wakeup[0], cid_c);
-
-        // finally c acquire lock success
-        acquired_c = latches.acquire(&mut lock_c, cid_c);
-        assert_eq!(acquired_c, true);
-
+        drop(inner_a);
+        assert_eq!(wake_c.get(), 2);
+        assert_ready!(t_c.poll_future(wake_c));
     }
 }

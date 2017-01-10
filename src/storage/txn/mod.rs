@@ -11,14 +11,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
 mod store;
 mod scheduler;
+pub mod meta;
 mod latch;
 
 use std::error;
 use std::io::Error as IoError;
 
-pub use self::scheduler::{Scheduler, Msg, GC_BATCH_SIZE, RESOLVE_LOCK_BATCH_SIZE};
+pub use self::meta::{GC_BATCH_SIZE, RESOLVE_LOCK_BATCH_SIZE};
+pub use self::scheduler::Scheduler;
 pub use self::store::SnapshotStore;
 
 quick_error! {

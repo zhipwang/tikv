@@ -226,8 +226,8 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             }
 
             self.region_ranges.insert(enc_end_key(region), region_id);
-            // No need to check duplicated here, because we use region id as the key
-            // in DB.
+        // No need to check duplicated here, because we use region id as the key
+        // in DB.
             self.region_peers.insert(region_id, peer);
             Ok(true)
         }));

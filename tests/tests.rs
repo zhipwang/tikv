@@ -38,6 +38,8 @@ extern crate tipb;
 extern crate time;
 extern crate rustc_serialize;
 extern crate test;
+extern crate futures;
+extern crate futures_cpupool;
 
 mod test_raft;
 mod test_raft_snap;

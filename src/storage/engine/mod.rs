@@ -21,6 +21,7 @@ use self::rocksdb::EngineRocksdb;
 use storage::{Key, Value, CfName, CF_DEFAULT};
 use kvproto::kvrpcpb::Context;
 use kvproto::errorpb::Error as ErrorHeader;
+use futures::sync::oneshot::Receiver;
 
 mod rocksdb;
 pub mod raftkv;
@@ -34,6 +35,7 @@ const SEEK_BOUND: usize = 30;
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
 
 pub type Callback<T> = Box<FnBox((CbContext, Result<T>)) + Send>;
+pub type Res<T> = Receiver<(CbContext, Result<T>)>;
 
 pub struct CbContext {
     pub term: Option<u64>,
@@ -52,6 +54,8 @@ pub enum Modify {
 }
 
 pub trait Engine: Send + Debug {
+    fn async_write_f(&self, ctx: &Context, batch: Vec<Modify>) -> Result<Res<()>>;
+    fn async_snapshot_f(&self, ctx: &Context) -> Result<Res<Box<Snapshot>>>;
     fn async_write(&self, ctx: &Context, batch: Vec<Modify>, callback: Callback<()>) -> Result<()>;
     fn async_snapshot(&self, ctx: &Context, callback: Callback<Box<Snapshot>>) -> Result<()>;
 

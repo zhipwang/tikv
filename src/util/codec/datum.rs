@@ -890,8 +890,7 @@ mod test {
 
     #[test]
     fn test_datum_codec() {
-        let table =
-            vec![vec![Datum::I64(1)],
+        let table = vec![vec![Datum::I64(1)],
                  vec![Datum::F64(1.0), Datum::F64(3.15), b"123".as_ref().into()],
                  vec![Datum::U64(1), Datum::F64(3.15), b"123".as_ref().into(), Datum::I64(-1)],
                  vec![Datum::Null],

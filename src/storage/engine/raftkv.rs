@@ -29,10 +29,11 @@ use std::time::Duration;
 use std::result;
 use rocksdb::DB;
 use protobuf::RepeatedField;
+use futures::sync::oneshot;
 
 use storage::engine;
 use super::{CbContext, Engine, Modify, Cursor, Snapshot, ScanMode, Callback,
-            Iterator as EngineIterator};
+            Iterator as EngineIterator, Res};
 use storage::{Key, Value, CfName, CF_DEFAULT};
 use super::metrics::*;
 
@@ -181,6 +182,92 @@ impl<S: RaftStoreRouter> Debug for RaftKv<S> {
 }
 
 impl<S: RaftStoreRouter> Engine for RaftKv<S> {
+    fn async_write_f(&self, ctx: &Context, mut modifies: Vec<Modify>) -> engine::Result<Res<()>> {
+        let reqs = modifies.drain(..)
+            .map(|m| {
+                let mut req = Request::new();
+                match m {
+                    Modify::Delete(cf, k) => {
+                        let mut delete = DeleteRequest::new();
+                        delete.set_key(k.encoded().to_owned());
+                        if cf != CF_DEFAULT {
+                            delete.set_cf(cf.to_string());
+                        }
+                        req.set_cmd_type(CmdType::Delete);
+                        req.set_delete(delete);
+                    }
+                    Modify::Put(cf, k, v) => {
+                        let mut put = PutRequest::new();
+                        put.set_key(k.encoded().to_owned());
+                        put.set_value(v);
+                        if cf != CF_DEFAULT {
+                            put.set_cf(cf.to_string());
+                        }
+                        req.set_cmd_type(CmdType::Put);
+                        req.set_put(put);
+                    }
+                }
+                req
+            })
+            .collect();
+
+        ASYNC_REQUESTS_COUNTER_VEC.with_label_values(&["write", "all"]).inc();
+        let req_timer = ASYNC_REQUESTS_DURATIONS_VEC.with_label_values(&["write"]).start_timer();
+
+        let (tx, rx) = oneshot::channel();
+        try!(self.exec_requests(ctx,
+                                reqs,
+                                box move |(cb_ctx, res)| {
+            match res {
+                Ok(CmdRes::Resp(_)) => {
+                    req_timer.observe_duration();
+                    ASYNC_REQUESTS_COUNTER_VEC.with_label_values(&["write", "success"]).inc();
+                    tx.complete((cb_ctx, Ok(())));
+                }
+                Ok(CmdRes::Snap(_)) => {
+                    tx.complete((cb_ctx,
+                                 Err(box_err!("unexpect snapshot, should mutate instead."))));
+                }
+                Err(e) => {
+                    ASYNC_REQUESTS_COUNTER_VEC.with_label_values(&["write", "failed"]).inc();
+                    tx.complete((cb_ctx, Err(e)));
+                }
+            }
+        }));
+        Ok(rx)
+    }
+
+    fn async_snapshot_f(&self, ctx: &Context) -> engine::Result<Res<Box<Snapshot>>> {
+        let mut req = Request::new();
+        req.set_cmd_type(CmdType::Snap);
+
+        ASYNC_REQUESTS_COUNTER_VEC.with_label_values(&["snapshot", "all"]).inc();
+        let req_timer = ASYNC_REQUESTS_DURATIONS_VEC.with_label_values(&["snapshot"]).start_timer();
+
+        let (tx, rx) = oneshot::channel();
+        try!(self.exec_requests(ctx,
+                                vec![req],
+                                box move |(cb_ctx, res)| {
+            match res {
+                Ok(CmdRes::Resp(r)) => {
+                    let e = Err(invalid_resp_type(CmdType::Snap, r[0].get_cmd_type()).into());
+                    tx.complete((cb_ctx, e));
+                }
+                Ok(CmdRes::Snap(s)) => {
+                    req_timer.observe_duration();
+                    ASYNC_REQUESTS_COUNTER_VEC.with_label_values(&["snapshot", "success"]).inc();
+                    let snap: Box<Snapshot> = box s;
+                    tx.complete((cb_ctx, Ok(snap)));
+                }
+                Err(e) => {
+                    ASYNC_REQUESTS_COUNTER_VEC.with_label_values(&["snapshot", "failed"]).inc();
+                    tx.complete((cb_ctx, Err(e)));
+                }
+            }
+        }));
+        Ok(rx)
+    }
+
     fn async_write(&self,
                    ctx: &Context,
                    mut modifies: Vec<Modify>,

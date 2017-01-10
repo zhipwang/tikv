@@ -12,15 +12,19 @@
 // limitations under the License.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 use std::thread;
+
+use futures::sync::oneshot;
+use futures::Future;
 use tikv::util::HandyRwLock;
 use tikv::storage::{self, Storage, Engine, Snapshot, Modify, Mutation, make_key, ALL_CFS, Options};
-use tikv::storage::engine::{self, Callback, Result};
-use tikv::storage::txn;
+use tikv::storage::engine::{self, Callback, Res, Result};
 use kvproto::kvrpcpb::Context;
+
 use raftstore::server::new_server_cluster_with_cfs;
 use raftstore::cluster::Cluster;
 use raftstore::server::ServerCluster;
@@ -91,7 +95,7 @@ fn test_raft_storage_store_not_match() {
     ctx.set_peer(peer);
     assert!(storage.get(ctx.clone(), &key, 20).is_err());
     let res = storage.get(ctx.clone(), &key, 20);
-    if let storage::Error::Txn(txn::Error::Engine(engine::Error::Request(ref e))) = *res.as_ref()
+    if let storage::Error::Engine(engine::Error::Request(ref e)) = *res.as_ref()
         .err()
         .unwrap() {
         assert!(e.has_store_not_match());
@@ -168,9 +172,7 @@ fn test_scheduler_leader_change_twice() {
                         10,
                         Options::default(),
                         box move |res: storage::Result<_>| {
-            if let storage::Error::Engine(engine::Error::Request(ref e)) = *res.as_ref()
-                .err()
-                .unwrap() {
+            if let Err(storage::Error::Engine(engine::Error::Request(ref e))) = res {
                 assert!(e.has_stale_command());
             } else {
                 panic!("expect stale command, but got {:?}", res);
@@ -188,28 +190,42 @@ fn test_scheduler_leader_change_twice() {
     rx.recv_timeout(Duration::from_secs(3)).unwrap();
 }
 
-#[derive(Debug)]
 struct BlockSnapshotEngine {
     engine: Box<Engine>,
     block_snapshot: Arc<AtomicBool>,
 }
 
+impl Debug for BlockSnapshotEngine {
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
+        write!(fmt, "blocksnapshotengine")
+    }
+}
+
 impl Engine for BlockSnapshotEngine {
-    fn async_write(&self, ctx: &Context, batch: Vec<Modify>, callback: Callback<()>) -> Result<()> {
-        self.engine.async_write(ctx, batch, callback)
+    fn async_write_f(&self, ctx: &Context, batch: Vec<Modify>) -> Result<Res<()>> {
+        self.engine.async_write_f(ctx, batch)
     }
 
-    fn async_snapshot(&self, ctx: &Context, callback: Callback<Box<Snapshot>>) -> Result<()> {
+    fn async_snapshot_f(&self, ctx: &Context) -> Result<Res<Box<Snapshot>>> {
         let block_snapshot = self.block_snapshot.clone();
-        self.engine.async_snapshot(ctx,
-                                   box move |res| {
-            thread::spawn(move || {
-                while block_snapshot.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(50));
-                }
-                callback(res);
-            });
-        })
+        let (tx, rx) = oneshot::channel();
+        let f = try!(self.engine.async_snapshot_f(ctx));
+        thread::spawn(move || {
+            let res = f.wait().unwrap();
+            while block_snapshot.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(50));
+            }
+            tx.complete(res);
+        });
+        Ok(rx)
+    }
+
+    fn async_write(&self, _: &Context, _: Vec<Modify>, _: Callback<()>) -> Result<()> {
+        unreachable!()
+    }
+
+    fn async_snapshot(&self, _: &Context, _: Callback<Box<Snapshot>>) -> Result<()> {
+        unreachable!()
     }
 
     fn clone(&self) -> Box<Engine + 'static> {

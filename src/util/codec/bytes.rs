@@ -255,8 +255,7 @@ mod tests {
 
     #[test]
     fn test_encode_bytes_compare() {
-        let pairs: Vec<(&[u8], &[u8], _)> =
-            vec![(b"", b"\x00", Ordering::Less),
+        let pairs: Vec<(&[u8], &[u8], _)> = vec![(b"", b"\x00", Ordering::Less),
                  (b"\x00", b"\x00", Ordering::Equal),
                  (b"\xFF", b"\x00", Ordering::Greater),
                  (b"\xFF", b"\xFF\x00", Ordering::Less),

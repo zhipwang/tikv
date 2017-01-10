@@ -21,8 +21,9 @@ use util::escape;
 use util::rocksdb;
 use util::worker::{Runnable, Worker, Scheduler};
 use super::{Engine, Snapshot, Modify, Cursor, Iterator as EngineIterator, Callback, TEMP_DIR,
-            ScanMode, Result, Error, CbContext};
+            ScanMode, Result, Error, CbContext, Res};
 use tempdir::TempDir;
+use futures::sync::oneshot;
 
 enum Task {
     Write(Vec<Modify>, Callback<()>),
@@ -137,6 +138,23 @@ fn write_modifies(db: &DB, modifies: Vec<Modify>) -> Result<()> {
 }
 
 impl Engine for EngineRocksdb {
+    fn async_write_f(&self, _: &Context, batch: Vec<Modify>) -> Result<Res<()>> {
+        let (tx, rx) = oneshot::channel();
+        box_try!(self.sched.schedule(Task::Write(batch,
+                                                 box move |r| {
+                                                     tx.complete(r);
+                                                 })));
+        Ok(rx)
+    }
+
+    fn async_snapshot_f(&self, _: &Context) -> Result<Res<Box<Snapshot>>> {
+        let (tx, rx) = oneshot::channel();
+        box_try!(self.sched.schedule(Task::Snapshot(box move |r| {
+            tx.complete(r);
+        })));
+        Ok(rx)
+    }
+
     fn async_write(&self, _: &Context, modifies: Vec<Modify>, cb: Callback<()>) -> Result<()> {
         box_try!(self.sched.schedule(Task::Write(modifies, cb)));
         Ok(())

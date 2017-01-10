@@ -11,14 +11,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+#![allow(dead_code)]
+#![allow(unused_variables)]
+
 use std::thread;
 use std::boxed::FnBox;
-use std::fmt::{self, Debug, Display, Formatter};
 use std::error;
 use std::sync::{Arc, Mutex};
 use std::io::Error as IoError;
 use kvproto::kvrpcpb::LockInfo;
-use mio::{EventLoop, EventLoopBuilder};
+use futures::sync::mpsc::{self, UnboundedSender, UnboundedReceiver};
 use self::metrics::*;
 
 pub mod engine;
@@ -32,7 +35,9 @@ pub use self::config::Config;
 pub use self::engine::{Engine, Snapshot, TEMP_DIR, new_local_engine, Modify, Cursor,
                        Error as EngineError, ScanMode};
 pub use self::engine::raftkv::RaftKv;
-pub use self::txn::{SnapshotStore, Scheduler, Msg};
+pub use self::txn::{SnapshotStore, Scheduler};
+use self::txn::meta::{Msg, Command, Get, BatchGet, Scan, Prewrite, Commit, Cleanup, Rollback,
+                      ScanLock, ResolveLockScan, GcScan, RawGet};
 pub use self::types::{Key, Value, KvPair, make_key};
 pub type Callback<T> = Box<FnBox(Result<T>) + Send>;
 
@@ -71,213 +76,6 @@ impl Mutation {
 
 use kvproto::kvrpcpb::Context;
 
-pub enum StorageCb {
-    Boolean(Callback<()>),
-    Booleans(Callback<Vec<Result<()>>>),
-    SingleValue(Callback<Option<Value>>),
-    KvPairs(Callback<Vec<Result<KvPair>>>),
-    Locks(Callback<Vec<LockInfo>>),
-}
-
-pub enum Command {
-    Get {
-        ctx: Context,
-        key: Key,
-        start_ts: u64,
-    },
-    BatchGet {
-        ctx: Context,
-        keys: Vec<Key>,
-        start_ts: u64,
-    },
-    Scan {
-        ctx: Context,
-        start_key: Key,
-        limit: usize,
-        start_ts: u64,
-        options: Options,
-    },
-    Prewrite {
-        ctx: Context,
-        mutations: Vec<Mutation>,
-        primary: Vec<u8>,
-        start_ts: u64,
-        options: Options,
-    },
-    Commit {
-        ctx: Context,
-        keys: Vec<Key>,
-        lock_ts: u64,
-        commit_ts: u64,
-    },
-    Cleanup {
-        ctx: Context,
-        key: Key,
-        start_ts: u64,
-    },
-    Rollback {
-        ctx: Context,
-        keys: Vec<Key>,
-        start_ts: u64,
-    },
-    ScanLock { ctx: Context, max_ts: u64 },
-    ResolveLock {
-        ctx: Context,
-        start_ts: u64,
-        commit_ts: Option<u64>,
-        scan_key: Option<Key>,
-        keys: Vec<Key>,
-    },
-    Gc {
-        ctx: Context,
-        safe_point: u64,
-        scan_key: Option<Key>,
-        keys: Vec<Key>,
-    },
-    RawGet { ctx: Context, key: Key },
-}
-
-impl Display for Command {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match *self {
-            Command::Get { ref ctx, ref key, start_ts, .. } => {
-                write!(f, "kv::command::get {} @ {} | {:?}", key, start_ts, ctx)
-            }
-            Command::BatchGet { ref ctx, ref keys, start_ts, .. } => {
-                write!(f,
-                       "kv::command_batch_get {} @ {} | {:?}",
-                       keys.len(),
-                       start_ts,
-                       ctx)
-            }
-            Command::Scan { ref ctx, ref start_key, limit, start_ts, .. } => {
-                write!(f,
-                       "kv::command::scan {}({}) @ {} | {:?}",
-                       start_key,
-                       limit,
-                       start_ts,
-                       ctx)
-            }
-            Command::Prewrite { ref ctx, ref mutations, start_ts, .. } => {
-                write!(f,
-                       "kv::command::prewrite mutations({}) @ {} | {:?}",
-                       mutations.len(),
-                       start_ts,
-                       ctx)
-            }
-            Command::Commit { ref ctx, ref keys, lock_ts, commit_ts, .. } => {
-                write!(f,
-                       "kv::command::commit {} {} -> {} | {:?}",
-                       keys.len(),
-                       lock_ts,
-                       commit_ts,
-                       ctx)
-            }
-            Command::Cleanup { ref ctx, ref key, start_ts, .. } => {
-                write!(f, "kv::command::cleanup {} @ {} | {:?}", key, start_ts, ctx)
-            }
-            Command::Rollback { ref ctx, ref keys, start_ts, .. } => {
-                write!(f,
-                       "kv::command::rollback keys({}) @ {} | {:?}",
-                       keys.len(),
-                       start_ts,
-                       ctx)
-            }
-            Command::ScanLock { ref ctx, max_ts, .. } => {
-                write!(f, "kv::scan_lock {} | {:?}", max_ts, ctx)
-            }
-            Command::ResolveLock { ref ctx, start_ts, commit_ts, .. } => {
-                write!(f,
-                       "kv::resolve_txn {} -> {:?} | {:?}",
-                       start_ts,
-                       commit_ts,
-                       ctx)
-            }
-            Command::Gc { ref ctx, safe_point, ref scan_key, .. } => {
-                write!(f,
-                       "kv::command::gc scan {:?} @ {} | {:?}",
-                       scan_key,
-                       safe_point,
-                       ctx)
-            }
-            Command::RawGet { ref ctx, ref key } => {
-                write!(f, "kv::command::rawget {:?} | {:?}", key, ctx)
-            }
-        }
-    }
-}
-
-impl Debug for Command {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
-impl Command {
-    pub fn readonly(&self) -> bool {
-        match *self {
-            Command::Get { .. } |
-            Command::BatchGet { .. } |
-            Command::Scan { .. } |
-            Command::ScanLock { .. } |
-            Command::RawGet { .. } => true,
-            Command::ResolveLock { ref keys, .. } |
-            Command::Gc { ref keys, .. } => keys.is_empty(),
-            _ => false,
-        }
-    }
-
-    pub fn tag(&self) -> &'static str {
-        match *self {
-            Command::Get { .. } => "get",
-            Command::BatchGet { .. } => "batch_get",
-            Command::Scan { .. } => "scan",
-            Command::Prewrite { .. } => "prewrite",
-            Command::Commit { .. } => "commit",
-            Command::Cleanup { .. } => "cleanup",
-            Command::Rollback { .. } => "rollback",
-            Command::ScanLock { .. } => "scan_lock",
-            Command::ResolveLock { .. } => "resolve_lock",
-            Command::Gc { .. } => "gc",
-            Command::RawGet { .. } => "raw_get",
-        }
-    }
-
-    pub fn get_context(&self) -> &Context {
-        match *self {
-            Command::Get { ref ctx, .. } |
-            Command::BatchGet { ref ctx, .. } |
-            Command::Scan { ref ctx, .. } |
-            Command::Prewrite { ref ctx, .. } |
-            Command::Commit { ref ctx, .. } |
-            Command::Cleanup { ref ctx, .. } |
-            Command::Rollback { ref ctx, .. } |
-            Command::ScanLock { ref ctx, .. } |
-            Command::ResolveLock { ref ctx, .. } |
-            Command::Gc { ref ctx, .. } |
-            Command::RawGet { ref ctx, .. } => ctx,
-        }
-    }
-
-    pub fn mut_context(&mut self) -> &mut Context {
-        match *self {
-            Command::Get { ref mut ctx, .. } |
-            Command::BatchGet { ref mut ctx, .. } |
-            Command::Scan { ref mut ctx, .. } |
-            Command::Prewrite { ref mut ctx, .. } |
-            Command::Commit { ref mut ctx, .. } |
-            Command::Cleanup { ref mut ctx, .. } |
-            Command::Rollback { ref mut ctx, .. } |
-            Command::ScanLock { ref mut ctx, .. } |
-            Command::ResolveLock { ref mut ctx, .. } |
-            Command::Gc { ref mut ctx, .. } |
-            Command::RawGet { ref mut ctx, .. } => ctx,
-        }
-    }
-}
-
-use util::transport::SendCh;
-
 #[derive(Default)]
 pub struct Options {
     pub lock_ttl: u64,
@@ -297,28 +95,26 @@ impl Options {
 
 struct StorageHandle {
     handle: Option<thread::JoinHandle<()>>,
-    event_loop: Option<EventLoop<Scheduler>>,
+    receiver: Option<UnboundedReceiver<Msg>>,
 }
 
 pub struct Storage {
     engine: Box<Engine>,
-    sendch: SendCh<Msg>,
+    sender: Option<UnboundedSender<Msg>>,
     handle: Arc<Mutex<StorageHandle>>,
 }
 
 impl Storage {
     pub fn from_engine(engine: Box<Engine>, config: &Config) -> Result<Storage> {
-        let event_loop = try!(create_event_loop(config.sched_notify_capacity,
-                                                config.sched_msg_per_tick));
-        let sendch = SendCh::new(event_loop.channel(), "kv-storage");
+        let (tx, rx) = mpsc::unbounded();
 
         info!("storage {:?} started.", engine);
         Ok(Storage {
             engine: engine,
-            sendch: sendch,
+            sender: Some(tx),
             handle: Arc::new(Mutex::new(StorageHandle {
                 handle: None,
-                event_loop: Some(event_loop),
+                receiver: Some(rx),
             })),
         })
     }
@@ -336,20 +132,17 @@ impl Storage {
 
         let engine = self.engine.clone();
         let builder = thread::Builder::new().name(thd_name!("storage-scheduler"));
-        let mut el = handle.event_loop.take().unwrap();
         let sched_concurrency = config.sched_concurrency;
         let sched_worker_pool_size = config.sched_worker_pool_size;
         let sched_too_busy_threshold = config.sched_too_busy_threshold;
-        let ch = self.sendch.clone();
+        let receiver = handle.receiver.take().unwrap();
         let h = try!(builder.spawn(move || {
             let mut sched = Scheduler::new(engine,
-                                           ch,
+                                           receiver,
                                            sched_concurrency,
                                            sched_worker_pool_size,
                                            sched_too_busy_threshold);
-            if let Err(e) = el.run(&mut sched) {
-                panic!("scheduler run err:{:?}", e);
-            }
+            sched.start();
             info!("scheduler stopped");
         }));
         handle.handle = Some(h);
@@ -363,10 +156,8 @@ impl Storage {
             return Ok(());
         }
 
-        if let Err(e) = self.sendch.send(Msg::Quit) {
-            error!("send quit cmd to scheduler failed, error:{:?}", e);
-            return Err(box_err!("failed to ask sched to quit: {:?}", e));
-        }
+        // So stream is stopped.
+        self.sender.take();
 
         let h = handle.handle.take().unwrap();
         if let Err(e) = h.join() {
@@ -381,8 +172,9 @@ impl Storage {
         self.engine.clone()
     }
 
-    fn send(&self, cmd: Command, cb: StorageCb) -> Result<()> {
-        box_try!(self.sendch.try_send(Msg::RawCmd { cmd: cmd, cb: cb }));
+    #[inline]
+    fn send<C: Command>(&self, cmd: C, cb: Callback<C::ResultSet>) -> Result<()> {
+        self.sender.clone().unwrap().send(cmd.into_msg(cb)).unwrap();
         Ok(())
     }
 
@@ -392,13 +184,13 @@ impl Storage {
                      start_ts: u64,
                      callback: Callback<Option<Value>>)
                      -> Result<()> {
-        let cmd = Command::Get {
+        let cmd = Get {
             ctx: ctx,
             key: key,
             start_ts: start_ts,
         };
         let tag = cmd.tag();
-        try!(self.send(cmd, StorageCb::SingleValue(callback)));
+        try!(self.send(cmd, callback));
         KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
         Ok(())
     }
@@ -409,13 +201,13 @@ impl Storage {
                            start_ts: u64,
                            callback: Callback<Vec<Result<KvPair>>>)
                            -> Result<()> {
-        let cmd = Command::BatchGet {
+        let cmd = BatchGet {
             ctx: ctx,
             keys: keys,
             start_ts: start_ts,
         };
         let tag = cmd.tag();
-        try!(self.send(cmd, StorageCb::KvPairs(callback)));
+        try!(self.send(cmd, callback));
         KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
         Ok(())
     }
@@ -428,7 +220,7 @@ impl Storage {
                       options: Options,
                       callback: Callback<Vec<Result<KvPair>>>)
                       -> Result<()> {
-        let cmd = Command::Scan {
+        let cmd = Scan {
             ctx: ctx,
             start_key: start_key,
             limit: limit,
@@ -436,7 +228,7 @@ impl Storage {
             options: options,
         };
         let tag = cmd.tag();
-        try!(self.send(cmd, StorageCb::KvPairs(callback)));
+        try!(self.send(cmd, callback));
         KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
         Ok(())
     }
@@ -449,7 +241,7 @@ impl Storage {
                           options: Options,
                           callback: Callback<Vec<Result<()>>>)
                           -> Result<()> {
-        let cmd = Command::Prewrite {
+        let cmd = Prewrite {
             ctx: ctx,
             mutations: mutations,
             primary: primary,
@@ -457,7 +249,7 @@ impl Storage {
             options: options,
         };
         let tag = cmd.tag();
-        try!(self.send(cmd, StorageCb::Booleans(callback)));
+        try!(self.send(cmd, callback));
         KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
         Ok(())
     }
@@ -469,14 +261,14 @@ impl Storage {
                         commit_ts: u64,
                         callback: Callback<()>)
                         -> Result<()> {
-        let cmd = Command::Commit {
+        let cmd = Commit {
             ctx: ctx,
             keys: keys,
             lock_ts: lock_ts,
             commit_ts: commit_ts,
         };
         let tag = cmd.tag();
-        try!(self.send(cmd, StorageCb::Boolean(callback)));
+        try!(self.send(cmd, callback));
         KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
         Ok(())
     }
@@ -487,13 +279,13 @@ impl Storage {
                          start_ts: u64,
                          callback: Callback<()>)
                          -> Result<()> {
-        let cmd = Command::Cleanup {
+        let cmd = Cleanup {
             ctx: ctx,
             key: key,
             start_ts: start_ts,
         };
         let tag = cmd.tag();
-        try!(self.send(cmd, StorageCb::Boolean(callback)));
+        try!(self.send(cmd, callback));
         KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
         Ok(())
     }
@@ -504,13 +296,13 @@ impl Storage {
                           start_ts: u64,
                           callback: Callback<()>)
                           -> Result<()> {
-        let cmd = Command::Rollback {
+        let cmd = Rollback {
             ctx: ctx,
             keys: keys,
             start_ts: start_ts,
         };
         let tag = cmd.tag();
-        try!(self.send(cmd, StorageCb::Boolean(callback)));
+        try!(self.send(cmd, callback));
         KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
         Ok(())
     }
@@ -520,12 +312,12 @@ impl Storage {
                            max_ts: u64,
                            callback: Callback<Vec<LockInfo>>)
                            -> Result<()> {
-        let cmd = Command::ScanLock {
+        let cmd = ScanLock {
             ctx: ctx,
             max_ts: max_ts,
         };
         let tag = cmd.tag();
-        try!(self.send(cmd, StorageCb::Locks(callback)));
+        try!(self.send(cmd, callback));
         KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
         Ok(())
     }
@@ -536,28 +328,28 @@ impl Storage {
                               commit_ts: Option<u64>,
                               callback: Callback<()>)
                               -> Result<()> {
-        let cmd = Command::ResolveLock {
+        let cmd = ResolveLockScan {
             ctx: ctx,
+            sender: self.sender.clone().unwrap(),
             start_ts: start_ts,
             commit_ts: commit_ts,
             scan_key: None,
-            keys: vec![],
         };
         let tag = cmd.tag();
-        try!(self.send(cmd, StorageCb::Boolean(callback)));
+        try!(self.send(cmd, callback));
         KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
         Ok(())
     }
 
     pub fn async_gc(&self, ctx: Context, safe_point: u64, callback: Callback<()>) -> Result<()> {
-        let cmd = Command::Gc {
+        let cmd = GcScan {
             ctx: ctx,
+            sender: self.sender.clone().unwrap(),
             safe_point: safe_point,
             scan_key: None,
-            keys: vec![],
         };
         let tag = cmd.tag();
-        try!(self.send(cmd, StorageCb::Boolean(callback)));
+        try!(self.send(cmd, callback));
         KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
         Ok(())
     }
@@ -567,11 +359,11 @@ impl Storage {
                          key: Vec<u8>,
                          callback: Callback<Option<Vec<u8>>>)
                          -> Result<()> {
-        let cmd = Command::RawGet {
+        let cmd = RawGet {
             ctx: ctx,
             key: Key::from_encoded(key),
         };
-        try!(self.send(cmd, StorageCb::SingleValue(callback)));
+        try!(self.send(cmd, callback));
         RAWKV_COMMAND_COUNTER_VEC.with_label_values(&["get"]).inc();
         Ok(())
     }
@@ -612,7 +404,7 @@ impl Clone for Storage {
     fn clone(&self) -> Storage {
         Storage {
             engine: self.engine.clone(),
-            sendch: self.sendch.clone(),
+            sender: self.sender.clone(),
             handle: self.handle.clone(),
         }
     }
@@ -651,16 +443,6 @@ quick_error! {
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;
-
-pub fn create_event_loop(notify_capacity: usize,
-                         messages_per_tick: usize)
-                         -> Result<EventLoop<Scheduler>> {
-    let mut builder = EventLoopBuilder::new();
-    builder.notify_capacity(notify_capacity);
-    builder.messages_per_tick(messages_per_tick);
-    let el = try!(builder.build());
-    Ok(el)
-}
 
 #[cfg(test)]
 mod tests {

@@ -314,7 +314,7 @@ impl PeerStorage {
             let mut entry = Entry::new();
             try!(entry.merge_from_bytes(value));
 
-            // May meet gap or has been compacted.
+        // May meet gap or has been compacted.
             if entry.get_index() != next_index {
                 return Ok(false);
             }
