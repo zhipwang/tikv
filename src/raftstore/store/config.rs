@@ -19,7 +19,7 @@ use time::Duration as TimeDuration;
 use raftstore::Result;
 
 const RAFT_BASE_TICK_INTERVAL: u64 = 100;
-const RAFT_HEARTBEAT_TICKS: usize = 20;
+const RAFT_HEARTBEAT_TICKS: usize = 10;
 const RAFT_ELECTION_TIMEOUT_TICKS: usize = 100;
 const RAFT_MAX_SIZE_PER_MSG: u64 = 1024 * 1024;
 const RAFT_MAX_INFLIGHT_MSGS: usize = 256;
