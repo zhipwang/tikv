@@ -505,7 +505,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
         let start_key = data_key(msg.get_start_key());
         if let Some((_, &exist_region_id)) = self.region_ranges
-            .range(Excluded(&start_key), Unbounded::<&Key>)
+            .range((Excluded(start_key), Unbounded::<Key>))
             .next() {
             let exist_region = self.region_peers[&exist_region_id].region();
             if enc_start_key(exist_region) < data_end_key(msg.get_end_key()) {
@@ -732,7 +732,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             return Ok(false);
         }
         if let Some((_, &exist_region_id)) = self.region_ranges
-            .range(Excluded(&enc_start_key(&snap_region)), Unbounded::<&Key>)
+            .range((Excluded(enc_start_key(&snap_region)), Unbounded::<Key>))
             .next() {
             let exist_region = self.region_peers[&exist_region_id].region();
             if enc_start_key(exist_region) < enc_end_key(&snap_region) {
@@ -1150,7 +1150,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             // received by the TiKV driver is newer than the meta cached in the driver, the meta is
             // updated.
             if let Some((_, &next_region_id)) = self.region_ranges
-                .range(Excluded(&enc_end_key(peer.region())), Unbounded::<&Key>)
+                .range((Excluded(enc_end_key(peer.region())), Unbounded::<Key>))
                 .next() {
                 let next_region = self.region_peers[&next_region_id].region();
                 new_regions.push(next_region.to_owned());
