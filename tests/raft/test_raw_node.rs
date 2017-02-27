@@ -31,8 +31,8 @@ use kvproto::eraftpb::*;
 use protobuf::{self, ProtobufEnum};
 use tikv::raft::*;
 use tikv::raft::storage::MemStorage;
-use test_raft::*;
-use test_raft_paper::*;
+use super::test_raft::*;
+use super::test_raft_paper::*;
 
 fn new_peer(id: u64) -> Peer {
     Peer { id: id, ..Default::default() }
@@ -65,7 +65,7 @@ fn new_ready(ss: Option<SoftState>,
         ss: ss,
         hs: hs,
         entries: entries,
-        committed_entries: committed_entries,
+        committed_entries: Some(committed_entries),
         ..Default::default()
     }
 }
@@ -98,6 +98,66 @@ fn test_raw_node_step() {
             assert_eq!(res, Err(Error::StepLocalMsg));
         }
     }
+}
+
+
+// test_raw_node_read_index_to_old_leader ensures that MsgReadIndex to old leader gets
+// forward to the new leader and 'send' method does not attach its term
+#[test]
+fn test_raw_node_read_index_to_old_leader() {
+    let r1 = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage());
+    let r2 = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage());
+    let r3 = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage());
+
+    let mut nt = Network::new(vec![Some(r1), Some(r2), Some(r3)]);
+
+    // elect r1 as leader
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut test_entries = Entry::new();
+    test_entries.set_data(b"testdata".to_vec());
+
+    // send readindex request to r2(follower)
+    let _ =
+        nt.peers.get_mut(&2).unwrap().step(new_message_with_entries(2,
+                                                                    2,
+                                                                    MessageType::MsgReadIndex,
+                                                                    vec![test_entries.clone()]));
+
+    // verify r2(follower) forwards this message to r1(leader) with term not set
+    assert_eq!(nt.peers[&2].msgs.len(), 1);
+    let read_index_msg1 =
+        new_message_with_entries(2, 1, MessageType::MsgReadIndex, vec![test_entries.clone()]);
+    assert_eq!(read_index_msg1, nt.peers[&2].msgs[0]);
+
+    // send readindex request to r3(follower)
+    let _ =
+        nt.peers.get_mut(&3).unwrap().step(new_message_with_entries(3,
+                                                                    3,
+                                                                    MessageType::MsgReadIndex,
+                                                                    vec![test_entries.clone()]));
+
+    // verify r3(follower) forwards this message to r1(leader) with term not set as well.
+    assert_eq!(nt.peers[&3].msgs.len(), 1);
+
+    let read_index_msg2 =
+        new_message_with_entries(3, 1, MessageType::MsgReadIndex, vec![test_entries.clone()]);
+    assert_eq!(nt.peers[&3].msgs[0], read_index_msg2);
+
+    // now elect r3 as leader
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+
+    // let r1 steps the two messages previously we got from r2, r3
+    let _ = nt.peers.get_mut(&1).unwrap().step(read_index_msg1);
+    let _ = nt.peers.get_mut(&1).unwrap().step(read_index_msg2);
+
+    // verify r1(follower) forwards these messages again to r3(new leader)
+    assert_eq!(nt.peers[&1].msgs.len(), 2);
+
+    let read_index_msg3 =
+        new_message_with_entries(1, 3, MessageType::MsgReadIndex, vec![test_entries.clone()]);
+
+    assert_eq!(nt.peers[&1].msgs[0], read_index_msg3);
+    assert_eq!(nt.peers[&1].msgs[1], read_index_msg3);
 }
 
 // test_raw_node_propose_and_conf_change ensures that RawNode.propose and
@@ -141,6 +201,61 @@ fn test_raw_node_propose_and_conf_change() {
     assert_eq!(entries[0].get_data(), "somedata".as_bytes());
     assert_eq!(entries[1].get_entry_type(), EntryType::EntryConfChange);
     assert_eq!(entries[1].get_data(), &*ccdata);
+}
+
+// test_raw_node_propose_add_duplicate_node ensures that two proposes to add the same node should
+// not affect the later propose to add new node.
+#[test]
+fn test_raw_node_propose_add_duplicate_node() {
+    let s = new_storage();
+    let mut raw_node = new_raw_node(1, vec![], 10, 1, s.clone(), vec![new_peer(1)]);
+    let rd = raw_node.ready();
+    s.wl().append(&rd.entries).expect("");
+    raw_node.advance(rd);
+
+    raw_node.campaign().expect("");
+    loop {
+        let rd = raw_node.ready();
+        s.wl().append(&rd.entries).expect("");
+        if rd.ss.is_some() && rd.ss.as_ref().unwrap().leader_id == raw_node.raft.id {
+            raw_node.advance(rd);
+            break;
+        }
+        raw_node.advance(rd);
+    }
+
+    let mut propose_conf_change_and_apply = |cc| {
+        raw_node.propose_conf_change(cc).expect("");
+        let rd = raw_node.ready();
+        s.wl().append(&rd.entries).expect("");
+        for e in rd.committed_entries.as_ref().unwrap() {
+            if e.get_entry_type() == EntryType::EntryConfChange {
+                let conf_change = protobuf::parse_from_bytes(e.get_data()).unwrap();
+                raw_node.apply_conf_change(&conf_change);
+            }
+        }
+        raw_node.advance(rd);
+    };
+
+    let cc1 = conf_change(ConfChangeType::AddNode, 1);
+    let ccdata1 = protobuf::Message::write_to_bytes(&cc1).unwrap();
+    propose_conf_change_and_apply(cc1.clone());
+
+    // try to add the same node again
+    propose_conf_change_and_apply(cc1);
+
+    // the new node join should be ok
+    let cc2 = conf_change(ConfChangeType::AddNode, 2);
+    let ccdata2 = protobuf::Message::write_to_bytes(&cc2).unwrap();
+    propose_conf_change_and_apply(cc2);
+
+    let last_index = s.last_index().unwrap();
+
+    // the last three entries should be: ConfChange cc1, cc1, cc2
+    let mut entries = s.entries(last_index - 2, last_index + 1, NO_LIMIT).unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].take_data(), ccdata1);
+    assert_eq!(entries[2].take_data(), ccdata2);
 }
 
 // test_raw_node_read_index ensures that RawNode.read_index sends the MsgReadIndex message

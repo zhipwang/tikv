@@ -28,6 +28,7 @@ use rand;
 use rand::Rng;
 use std::time::Duration;
 use std::sync::*;
+use std::thread;
 use std::sync::atomic::*;
 
 fn test_multi_base<T: Simulator>(cluster: &mut Cluster<T>) {
@@ -42,20 +43,17 @@ fn test_multi_base_after_bootstrap<T: Simulator>(cluster: &mut Cluster<T>) {
     cluster.must_put(key, value);
     assert_eq!(cluster.must_get(key), Some(value.to_vec()));
 
-    let check_res = cluster.check_quorum(|engine| {
+    cluster.assert_quorum(|engine| {
         match engine.get_value(&keys::data_key(key)).unwrap() {
             None => false,
             Some(v) => &*v == value,
         }
     });
-    assert!(check_res);
 
     cluster.must_delete(key);
     assert_eq!(cluster.must_get(key), None);
 
-    let check_res =
-        cluster.check_quorum(|engine| engine.get_value(&keys::data_key(key)).unwrap().is_none());
-    assert!(check_res);
+    cluster.assert_quorum(|engine| engine.get_value(&keys::data_key(key)).unwrap().is_none());
 
     // TODO add stale epoch test cases.
 }
@@ -364,7 +362,7 @@ fn test_leader_change_with_uncommitted_log<T: Simulator>(cluster: &mut Cluster<T
     put.mut_header().set_peer(new_peer(2, 2));
     cluster.clear_send_filters();
     let resp = cluster.call_command(put, Duration::from_secs(5)).unwrap();
-    assert!(!resp.get_header().has_error(), format!("{:?}", resp));
+    assert!(!resp.get_header().has_error(), "{:?}", resp);
 
     for i in 1..4 {
         must_get_equal(&cluster.get_engine(i), b"k2", b"v2");
@@ -434,7 +432,7 @@ fn test_node_leader_change_with_log_overlap() {
                       box move |resp: RaftCmdResponse| {
                           called_.store(true, Ordering::SeqCst);
                           assert!(resp.get_header().has_error());
-                          assert!(resp.get_header().get_error().has_not_leader());
+                          assert!(resp.get_header().get_error().has_stale_command());
                       })
         .unwrap();
 
@@ -595,7 +593,8 @@ fn test_remove_leader_with_uncommitted_log<T: Simulator>(cluster: &mut Cluster<T
     let resp = cluster.call_command(put, Duration::from_secs(5)).unwrap();
     assert!(resp.get_header().has_error());
     assert!(resp.get_header().get_error().has_region_not_found(),
-            format!("{:?} should have region not found", resp));
+            "{:?} should have region not found",
+            resp);
 }
 
 #[test]
@@ -663,4 +662,69 @@ fn test_node_dropped_proposal() {
 
     // Although proposal is dropped, callback should be cleaned up in time.
     rx.recv_timeout(Duration::from_secs(5)).expect("callback should have been called with in 5s.");
+}
+
+fn test_consistency_check<T: Simulator>(cluster: &mut Cluster<T>) {
+    cluster.cfg.raft_store.raft_election_timeout_ticks = 50;
+    // disable compact log to make test more stable.
+    cluster.cfg.raft_store.raft_log_gc_threshold = 1000;
+    cluster.cfg.raft_store.consistency_check_tick_interval = 1;
+    // We use three peers([1, 2, 3]) for this test.
+    cluster.run();
+
+    for i in 0..300 {
+        cluster.must_put(format!("k{:06}", i).as_bytes(),
+                         format!("k{:06}", i).as_bytes());
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn test_node_consistency_check() {
+    let mut cluster = new_node_cluster(0, 2);
+    test_consistency_check(&mut cluster);
+}
+
+#[test]
+fn test_server_consistency_check() {
+    let mut cluster = new_server_cluster(0, 2);
+    test_consistency_check(&mut cluster);
+}
+
+fn test_batch_write<T: Simulator>(cluster: &mut Cluster<T>) {
+    cluster.run();
+    let r = cluster.get_region(b"");
+    cluster.must_split(&r, b"k3");
+    // update epoch.
+    let r = cluster.get_region(b"");
+
+    let req = new_request(r.get_id(),
+                          r.get_region_epoch().clone(),
+                          vec![new_put_cmd(b"k1", b"v1"), new_put_cmd(b"k2", b"v2")],
+                          false);
+    let resp = cluster.call_command_on_leader(req, Duration::from_secs(3)).unwrap();
+    assert!(!resp.get_header().has_error());
+    assert_eq!(cluster.must_get(b"k1"), Some(b"v1".to_vec()));
+    assert_eq!(cluster.must_get(b"k2"), Some(b"v2".to_vec()));
+
+    let req = new_request(r.get_id(),
+                          r.get_region_epoch().clone(),
+                          vec![new_put_cmd(b"k1", b"v3"), new_put_cmd(b"k3", b"v3")],
+                          false);
+    let resp = cluster.call_command_on_leader(req, Duration::from_secs(3)).unwrap();
+    assert!(resp.get_header().has_error());
+    assert_eq!(cluster.must_get(b"k1"), Some(b"v1".to_vec()));
+    assert_eq!(cluster.must_get(b"k3"), None);
+}
+
+#[test]
+fn test_node_batch_write() {
+    let mut cluster = new_node_cluster(0, 3);
+    test_batch_write(&mut cluster);
+}
+
+#[test]
+fn test_server_batch_write() {
+    let mut cluster = new_server_cluster(0, 3);
+    test_batch_write(&mut cluster);
 }

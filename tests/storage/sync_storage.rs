@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tikv::storage::{Storage, Engine, Key, Value, KvPair, Mutation, Result};
+use tikv::storage::{Storage, Engine, Key, Value, KvPair, Mutation, Result, Options};
 use tikv::storage::config::Config;
 use kvproto::kvrpcpb::{Context, LockInfo};
 
@@ -68,7 +68,16 @@ impl SyncStorage {
                 key_only: bool,
                 start_ts: u64)
                 -> Result<Vec<Result<KvPair>>> {
-        wait_op!(|cb| self.store.async_scan(ctx, key, limit, key_only, start_ts, cb).unwrap())
+        wait_op!(|cb| {
+                self.store
+                    .async_scan(ctx,
+                                key,
+                                limit,
+                                start_ts,
+                                Options::new(0, false, key_only),
+                                cb)
+                    .unwrap()
+            })
             .unwrap()
     }
 
@@ -78,7 +87,11 @@ impl SyncStorage {
                     primary: Vec<u8>,
                     start_ts: u64)
                     -> Result<Vec<Result<()>>> {
-        wait_op!(|cb| self.store.async_prewrite(ctx, mutations, primary, start_ts, 0, cb).unwrap())
+        wait_op!(|cb| {
+                self.store
+                    .async_prewrite(ctx, mutations, primary, start_ts, Options::default(), cb)
+                    .unwrap()
+            })
             .unwrap()
     }
 
@@ -109,6 +122,18 @@ impl SyncStorage {
 
     pub fn gc(&self, ctx: Context, safe_point: u64) -> Result<()> {
         wait_op!(|cb| self.store.async_gc(ctx, safe_point, cb).unwrap()).unwrap()
+    }
+
+    pub fn raw_get(&self, ctx: Context, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        wait_op!(|cb| self.store.async_raw_get(ctx, key, cb).unwrap()).unwrap()
+    }
+
+    pub fn raw_put(&self, ctx: Context, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        wait_op!(|cb| self.store.async_raw_put(ctx, key, value, cb).unwrap()).unwrap()
+    }
+
+    pub fn raw_delete(&self, ctx: Context, key: Vec<u8>) -> Result<()> {
+        wait_op!(|cb| self.store.async_raw_delete(ctx, key, cb).unwrap()).unwrap()
     }
 }
 

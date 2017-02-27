@@ -30,10 +30,8 @@ use super::node::new_node_cluster;
 use super::server::new_server_cluster;
 use super::util::*;
 
-
 fn test_huge_snapshot<T: Simulator>(cluster: &mut Cluster<T>) {
-    // init_log();
-    cluster.cfg.raft_store.raft_log_gc_limit = 1000;
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 1000;
     cluster.cfg.raft_store.raft_log_gc_tick_interval = 10;
     cluster.cfg.raft_store.snap_apply_batch_size = 500;
     let pd_client = cluster.pd_client.clone();
@@ -103,7 +101,7 @@ fn test_server_huge_snapshot() {
 fn test_snap_gc<T: Simulator>(cluster: &mut Cluster<T>) {
     // truncate the log quickly so that we can force sending snapshot.
     cluster.cfg.raft_store.raft_log_gc_tick_interval = 20;
-    cluster.cfg.raft_store.raft_log_gc_limit = 2;
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 2;
     cluster.cfg.raft_store.snap_mgr_gc_tick_interval = 50;
     cluster.cfg.raft_store.snap_gc_timeout = 2;
 
@@ -114,6 +112,7 @@ fn test_snap_gc<T: Simulator>(cluster: &mut Cluster<T>) {
     cluster.must_put(b"k1", b"v1");
     pd_client.must_add_peer(r1, new_peer(2, 2));
     must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+
     let (tx, rx) = mpsc::channel();
     // drop all the snapshot so we can detect stale snapfile.
     cluster.sim.wl().add_recv_filter(3, box DropSnapshotFilter::new(tx));
@@ -194,34 +193,43 @@ fn test_server_snap_gc() {
     test_snap_gc(&mut cluster);
 }
 
+/// A helper function for testing the handling of snapshot is correct
+/// when there are multiple snapshots which have overlapped region ranges
+/// arrive at the same raftstore.
 fn test_concurrent_snap<T: Simulator>(cluster: &mut Cluster<T>) {
-    // util::init_log();
-    // disable raft log gc.
+    // Disable raft log gc in this test case.
     cluster.cfg.raft_store.raft_log_gc_tick_interval = 60000;
 
     let pd_client = cluster.pd_client.clone();
     // Disable default max peer count check.
     pd_client.disable_default_rule();
+
     let r1 = cluster.run_conf_change();
     cluster.must_put(b"k1", b"v1");
     pd_client.must_add_peer(r1, new_peer(2, 2));
-    // peer 2 can't step to leader.
+    // Force peer 2 to be followers all the way.
     cluster.add_send_filter(CloneFilterFactory(RegionPacketFilter::new(r1, 2)
         .msg_type(MessageType::MsgRequestVote)
         .direction(Direction::Send)));
     cluster.must_transfer_leader(r1, new_peer(1, 1));
     cluster.must_put(b"k3", b"v3");
-    // Now peer 1 can't send snapshot to peer 2
-    cluster.sim.wl().add_recv_filter(3, box PauseFirstSnapshotFilter::new());
-    cluster.sim.wl().add_recv_filter(1, box PauseFirstSnapshotFilter::new());
+    // Pile up snapshots of overlapped region ranges and deliver them all at once.
+    let (tx, rx) = mpsc::channel();
+    cluster.sim.wl().add_recv_filter(3, box CollectSnapshotFilter::new(tx));
     pd_client.must_add_peer(r1, new_peer(3, 3));
     let region = cluster.get_region(b"k1");
-    // TODO: should check whether snapshot has been sent before split.
+    // Ensure the snapshot of range ("", "") is sent and piled in filter.
+    if let Err(e) = rx.recv_timeout(Duration::from_secs(1)) {
+        panic!("the snapshot is not sent before split, e: {:?}", e);
+    }
+    // Split the region range and then there should be another snapshot for the split ranges.
     cluster.must_split(&region, b"k2");
     must_get_equal(&cluster.get_engine(3), b"k3", b"v3");
+    // Ensure the regions work after split.
+    cluster.must_put(b"k11", b"v11");
+    must_get_equal(&cluster.get_engine(3), b"k11", b"v11");
     cluster.must_put(b"k4", b"v4");
     must_get_equal(&cluster.get_engine(3), b"k4", b"v4");
-    must_get_equal(&cluster.get_engine(3), b"k3", b"v3");
 }
 
 #[test]
@@ -239,7 +247,7 @@ fn test_server_concurrent_snap() {
 fn test_cf_snapshot<T: Simulator>(cluster: &mut Cluster<T>) {
     // truncate the log quickly so that we can force sending snapshot.
     cluster.cfg.raft_store.raft_log_gc_tick_interval = 20;
-    cluster.cfg.raft_store.raft_log_gc_limit = 2;
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 2;
     cluster.cfg.raft_store.snap_mgr_gc_tick_interval = 50;
     cluster.cfg.raft_store.snap_gc_timeout = 2;
 
@@ -326,7 +334,7 @@ fn test_node_stale_snap() {
     let mut cluster = new_node_cluster(0, 3);
     // disable compact log to make snapshot only be sent when peer is first added.
     cluster.cfg.raft_store.raft_log_gc_threshold = 1000;
-    cluster.cfg.raft_store.raft_log_gc_limit = 1000;
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 1000;
 
     let pd_client = cluster.pd_client.clone();
     // Disable default max peer count check.
@@ -412,7 +420,7 @@ impl Filter<Msg> for SnapshotAppendFilter {
 fn test_snapshot_with_append<T: Simulator>(cluster: &mut Cluster<T>) {
     // truncate the log quickly so that we can force sending snapshot.
     cluster.cfg.raft_store.raft_log_gc_tick_interval = 20;
-    cluster.cfg.raft_store.raft_log_gc_limit = 2;
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 2;
     cluster.cfg.raft_store.snap_mgr_gc_tick_interval = 50;
     cluster.cfg.raft_store.snap_gc_timeout = 2;
 

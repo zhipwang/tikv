@@ -53,6 +53,7 @@ struct Cluster {
     split_count: usize,
 
     down_peers: HashMap<u64, pdpb::PeerStats>,
+    pending_peers: HashMap<u64, metapb::Peer>,
 }
 
 impl Cluster {
@@ -71,6 +72,7 @@ impl Cluster {
             store_stats: HashMap::new(),
             split_count: 0,
             down_peers: HashMap::new(),
+            pending_peers: HashMap::new(),
         }
     }
 
@@ -105,12 +107,15 @@ impl Cluster {
     }
 
     fn get_store(&self, store_id: u64) -> Result<metapb::Store> {
-        Ok(self.stores.get(&store_id).unwrap().store.clone())
+        match self.stores.get(&store_id) {
+            None => Err(box_err!("store {} not found", store_id)),
+            Some(s) => Ok(s.store.clone()),
+        }
     }
 
     fn get_region(&self, key: Vec<u8>) -> Option<metapb::Region> {
         self.regions
-            .range::<Key, Key>(Excluded(&key), Unbounded)
+            .range((Excluded(key), Unbounded))
             .next()
             .map(|(_, region)| region.clone())
     }
@@ -137,7 +142,7 @@ impl Cluster {
 
     fn handle_heartbeat_version(&mut self, region: metapb::Region) -> Result<()> {
         // For split, we should handle heartbeat carefully.
-        // E.g, for region 1 [a, c) -> 2 [a, b) + 1 [b, c).
+        // E.g, for region 1 [a, c) -> 1 [a, b) + 2 [b, c).
         // after split, region 1 and 2 will do heartbeat independently.
         let start_key = enc_start_key(&region);
         let end_key = enc_end_key(&region);
@@ -172,7 +177,7 @@ impl Cluster {
             self.add_region(&region);
         } else {
             // overlap, remove old, insert new.
-            // E.g, 1 [a, c) -> 2 [a, b) + 1 [b, c), either new 1 or 2 reports, the region
+            // E.g, 1 [a, c) -> 1 [a, b) + 2 [b, c), either new 1 or 2 reports, the region
             // is overlapped with origin [a, c).
             if version <= search_version || conf_ver < search_conf_ver {
                 return Err(box_err!("epoch {:?} is stale.", region.get_region_epoch()));
@@ -192,6 +197,7 @@ impl Cluster {
         let conf_ver = region.get_region_epoch().get_conf_ver();
         let end_key = enc_end_key(&region);
 
+        // it can pass handle_heartbeat_version means it must exist.
         let cur_region = self.get_region_by_id(region.get_id()).unwrap().unwrap();
 
         let cur_conf_ver = cur_region.get_region_epoch().get_conf_ver();
@@ -274,18 +280,18 @@ impl Cluster {
     fn region_heartbeat(&mut self,
                         region: metapb::Region,
                         leader: metapb::Peer,
-                        down_peers: Vec<pdpb::PeerStats>)
+                        down_peers: Vec<pdpb::PeerStats>,
+                        pending_peers: Vec<metapb::Peer>)
                         -> Result<pdpb::RegionHeartbeatResponse> {
-        for peer in &down_peers {
-            self.down_peers.insert(peer.get_peer().get_id(), peer.clone());
-        }
-        let active_peers: Vec<_> = region.get_peers()
-            .iter()
-            .filter(|p| !down_peers.iter().any(|d| p.get_id() == d.get_peer().get_id()))
-            .cloned()
-            .collect();
-        for peer in &active_peers {
+        for peer in region.get_peers() {
             self.down_peers.remove(&peer.get_id());
+            self.pending_peers.remove(&peer.get_id());
+        }
+        for peer in down_peers {
+            self.down_peers.insert(peer.get_peer().get_id(), peer);
+        }
+        for p in pending_peers {
+            self.pending_peers.insert(p.get_id(), p);
         }
 
         try!(self.handle_heartbeat_version(region.clone()));
@@ -360,6 +366,10 @@ impl TestPdClient {
     // Clear the customized rule set before and use default rule again.
     pub fn reset_rule(&self) {
         self.cluster.wl().rule = None;
+    }
+
+    pub fn get_region_epoch(&self, region_id: u64) -> metapb::RegionEpoch {
+        self.get_region_by_id(region_id).unwrap().unwrap().take_region_epoch()
     }
 
     // Set an empty rule which nothing to do to disable default max peer count
@@ -475,6 +485,10 @@ impl TestPdClient {
     pub fn get_down_peers(&self) -> HashMap<u64, pdpb::PeerStats> {
         self.cluster.rl().down_peers.clone()
     }
+
+    pub fn get_pending_peers(&self) -> HashMap<u64, metapb::Peer> {
+        self.cluster.rl().pending_peers.clone()
+    }
 }
 
 impl PdClient for TestPdClient {
@@ -536,10 +550,11 @@ impl PdClient for TestPdClient {
     fn region_heartbeat(&self,
                         region: metapb::Region,
                         leader: metapb::Peer,
-                        down_peers: Vec<pdpb::PeerStats>)
+                        down_peers: Vec<pdpb::PeerStats>,
+                        pending_peers: Vec<metapb::Peer>)
                         -> Result<pdpb::RegionHeartbeatResponse> {
         try!(self.check_bootstrap());
-        self.cluster.wl().region_heartbeat(region, leader, down_peers)
+        self.cluster.wl().region_heartbeat(region, leader, down_peers, pending_peers)
     }
 
     fn ask_split(&self, region: metapb::Region) -> Result<pdpb::AskSplitResponse> {

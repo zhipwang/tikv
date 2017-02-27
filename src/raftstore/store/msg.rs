@@ -11,14 +11,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::Instant;
 use std::boxed::{Box, FnBox};
 use std::fmt;
 
-use kvproto::eraftpb::Snapshot;
 use kvproto::raft_serverpb::RaftMessage;
 use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse};
 use kvproto::metapb::RegionEpoch;
 use raft::SnapshotStatus;
+
+use util::escape;
 
 pub type Callback = Box<FnBox(RaftCmdResponse) + Send>;
 
@@ -32,6 +34,14 @@ pub enum Tick {
     PdStoreHeartbeat,
     SnapGc,
     CompactLockCf,
+    ConsistencyCheck,
+    ReportRegionFlow,
+}
+
+pub struct SnapshotStatusMsg {
+    pub region_id: u64,
+    pub to_peer_id: u64,
+    pub status: SnapshotStatus,
 }
 
 pub enum Msg {
@@ -39,7 +49,9 @@ pub enum Msg {
 
     // For notify.
     RaftMessage(RaftMessage),
+
     RaftCmd {
+        send_time: Instant,
         request: RaftCmdRequest,
         callback: Callback,
     },
@@ -51,19 +63,16 @@ pub enum Msg {
         split_key: Vec<u8>,
     },
 
-    ReportSnapshot {
-        region_id: u64,
-        to_peer_id: u64,
-        status: SnapshotStatus,
-    },
-
     ReportUnreachable { region_id: u64, to_peer_id: u64 },
 
     // For snapshot stats.
     SnapshotStats,
-    SnapGenRes {
+
+    // For consistency check
+    ComputeHashResult {
         region_id: u64,
-        snap: Option<Snapshot>,
+        index: u64,
+        hash: Vec<u8>,
     },
 }
 
@@ -74,13 +83,6 @@ impl fmt::Debug for Msg {
             Msg::RaftMessage(_) => write!(fmt, "Raft Message"),
             Msg::RaftCmd { .. } => write!(fmt, "Raft Command"),
             Msg::SplitCheckResult { .. } => write!(fmt, "Split Check Result"),
-            Msg::ReportSnapshot { ref region_id, ref to_peer_id, ref status } => {
-                write!(fmt,
-                       "Send snapshot to {} for region {} {:?}",
-                       to_peer_id,
-                       region_id,
-                       status)
-            }
             Msg::ReportUnreachable { ref region_id, ref to_peer_id } => {
                 write!(fmt,
                        "peer {} for region {} is unreachable",
@@ -88,12 +90,23 @@ impl fmt::Debug for Msg {
                        region_id)
             }
             Msg::SnapshotStats => write!(fmt, "Snapshot stats"),
-            Msg::SnapGenRes { region_id, ref snap } => {
+            Msg::ComputeHashResult { region_id, index, ref hash } => {
                 write!(fmt,
-                       "SnapGenRes [region_id: {}, is_success: {}]",
+                       "ComputeHashResult [region_id: {}, index: {}, hash: {}]",
                        region_id,
-                       snap.is_some())
+                       index,
+                       escape(&hash))
             }
+        }
+    }
+}
+
+impl Msg {
+    pub fn new_raft_cmd(request: RaftCmdRequest, callback: Callback) -> Msg {
+        Msg::RaftCmd {
+            send_time: Instant::now(),
+            request: request,
+            callback: callback,
         }
     }
 }
@@ -116,12 +129,8 @@ mod tests {
                     timeout: Duration)
                     -> Result<RaftCmdResponse, Error> {
         wait_op!(|cb: Box<FnBox(RaftCmdResponse) + 'static + Send>| {
-            sendch.try_send(Msg::RaftCmd {
-                    request: request,
-                    callback: cb,
-                })
-                .unwrap()
-        },
+                     sendch.try_send(Msg::new_raft_cmd(request, cb)).unwrap()
+                 },
                  timeout)
             .ok_or_else(|| Error::Timeout(format!("request timeout for {:?}", timeout)))
     }
@@ -135,7 +144,7 @@ mod tests {
         fn notify(&mut self, event_loop: &mut EventLoop<Self>, msg: Self::Message) {
             match msg {
                 Msg::Quit => event_loop.shutdown(),
-                Msg::RaftCmd { callback, request } => {
+                Msg::RaftCmd { callback, request, .. } => {
                     // a trick for test timeout.
                     if request.get_header().get_region_id() == u64::max_value() {
                         thread::sleep(Duration::from_millis(100));
