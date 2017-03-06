@@ -373,7 +373,7 @@ impl ApplyDelegate {
 
         ctx.apply_state.set_applied_index(index);
         if !self.pending_remove {
-            ctx.save(self.region.get_id())
+            ctx.save(&self.engine, self.region.get_id())
                 .unwrap_or_else(|e| panic!("{} failed to save apply context: {:?}", self.tag, e));
         }
 
@@ -446,7 +446,6 @@ impl ApplyDelegate {
 
     fn new_ctx<'a>(&self, index: u64, term: u64, req: &'a RaftCmdRequest) -> ExecContext<'a> {
         ExecContext {
-            snap: Snapshot::new(self.engine.clone()),
             apply_state: self.apply_state.clone(),
             wb: WriteBatch::new(),
             req: req,
@@ -457,7 +456,6 @@ impl ApplyDelegate {
 }
 
 struct ExecContext<'a> {
-    snap: Snapshot,
     apply_state: RaftApplyState,
     wb: WriteBatch,
     req: &'a RaftCmdRequest,
@@ -466,8 +464,8 @@ struct ExecContext<'a> {
 }
 
 impl<'a> ExecContext<'a> {
-    fn save(&self, region_id: u64) -> Result<()> {
-        let raft_cf = try!(self.snap.cf_handle(CF_RAFT));
+    fn save(&self, engine: &DB, region_id: u64) -> Result<()> {
+        let raft_cf = try!(rocksdb::get_cf_handle(engine, CF_RAFT));
         try!(self.wb.put_msg_cf(raft_cf,
                                 &keys::apply_state_key(region_id),
                                 &self.apply_state));
@@ -735,10 +733,12 @@ impl ApplyDelegate {
         for req in requests {
             let cmd_type = req.get_cmd_type();
             let mut resp = try!(match cmd_type {
-                CmdType::Get => self.handle_get(ctx, req),
                 CmdType::Put => self.handle_put(ctx, req),
                 CmdType::Delete => self.handle_delete(ctx, req),
-                CmdType::Snap => self.handle_snap(ctx, req),
+                CmdType::Get | CmdType::Snap => {
+                    error!("read command should not be proposed, please upgrade TiKV server");
+                    Err(box_err!("command can't be handled, please upgrade TiKV server"))
+                }
                 CmdType::Invalid => Err(box_err!("invalid cmd type, message maybe currupted")),
             });
 
@@ -750,10 +750,6 @@ impl ApplyDelegate {
         let mut resp = RaftCmdResponse::new();
         resp.set_responses(RepeatedField::from_vec(responses));
         Ok(resp)
-    }
-
-    fn handle_get(&mut self, ctx: &ExecContext, req: &Request) -> Result<Response> {
-        do_get(&self.tag, &self.region, &ctx.snap, req)
     }
 
     fn handle_put(&mut self, ctx: &ExecContext, req: &Request) -> Result<Response> {
@@ -817,10 +813,6 @@ impl ApplyDelegate {
         }
 
         Ok(resp)
-    }
-
-    fn handle_snap(&mut self, _: &ExecContext, _: &Request) -> Result<Response> {
-        do_snap(self.region.clone())
     }
 }
 
