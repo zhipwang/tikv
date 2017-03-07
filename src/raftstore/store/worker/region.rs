@@ -19,13 +19,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use std::str;
 
-use rocksdb::{DB, Writable, WriteBatch};
+use rocksdb::{DB, Writable};
 use kvproto::raft_serverpb::{RaftApplyState, RegionLocalState, PeerState};
 use kvproto::eraftpb::Snapshot as RaftSnapshot;
 
 use util::worker::Runnable;
 use util::{escape, HandyRwLock, rocksdb};
-use raftstore::store::engine::{Mutable, Snapshot, Iterable, IterOption, SeekMode};
+use raftstore::store::engine::{Mutable, Snapshot};
 use raftstore::store::peer_storage::{JOB_STATUS_FINISHED, JOB_STATUS_CANCELLED, JOB_STATUS_FAILED,
                                      JOB_STATUS_CANCELLING, JOB_STATUS_PENDING, JOB_STATUS_RUNNING};
 use raftstore::store::{self, check_abort, SnapManager, SnapKey, SnapEntry, ApplyContext, keys,
@@ -130,46 +130,10 @@ impl Runner {
                            end_key: &[u8],
                            abort: &AtomicUsize)
                            -> Result<()> {
-        let mut wb = WriteBatch::new();
-        let mut size_cnt = 0;
         for cf in self.db.cf_names() {
             try!(check_abort(&abort));
             let handle = box_try!(rocksdb::get_cf_handle(&self.db, cf));
-
-            let mut it = box_try!(self.db
-                .new_iterator_cf(cf,
-                                 IterOption::new(Some(end_key.to_vec()),
-                                                 false,
-                                                 SeekMode::TotalOrderSeek)));
-
-            try!(check_abort(&abort));
-            it.seek(start_key.into());
-            while it.valid() {
-                {
-                    let key = it.key();
-                    if key >= end_key {
-                        break;
-                    }
-
-                    box_try!(wb.delete_cf(handle, key));
-                    size_cnt += key.len();
-                    if size_cnt >= self.batch_size {
-                        // Can't use write_without_wal here.
-                        // Otherwise it may cause dirty data when applying snapshot.
-                        box_try!(self.db.write(wb));
-                        wb = WriteBatch::new();
-                        size_cnt = 0;
-                    }
-                };
-                try!(check_abort(&abort));
-                if !it.next() {
-                    break;
-                }
-            }
-        }
-
-        if wb.count() > 0 {
-            box_try!(self.db.write(wb));
+            box_try!(self.db.delete_range_cf(handle, start_key, end_key));
         }
         Ok(())
     }
