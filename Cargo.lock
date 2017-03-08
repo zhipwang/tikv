@@ -318,7 +318,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "librocksdb_sys"
 version = "0.1.0"
-source = "git+https://github.com/pingcap/rust-rocksdb.git?branch=hhkbp2/add-delete-range#7b8bb9c950a58d7d0d1c599ef91ea8e4e71a8103"
+source = "git+https://github.com/pingcap/rust-rocksdb.git?branch=hhkbp2/add-delete-range#6a4cba2fad7a4d0e598d2d3aceab5281204fb44a"
 dependencies = [
  "gcc 0.3.35 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.2.16 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -558,7 +558,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "rocksdb"
 version = "0.3.0"
-source = "git+https://github.com/pingcap/rust-rocksdb.git?branch=hhkbp2/add-delete-range#7b8bb9c950a58d7d0d1c599ef91ea8e4e71a8103"
+source = "git+https://github.com/pingcap/rust-rocksdb.git?branch=hhkbp2/add-delete-range#6a4cba2fad7a4d0e598d2d3aceab5281204fb44a"
 dependencies = [
  "libc 0.2.16 (registry+https://github.com/rust-lang/crates.io-index)",
  "librocksdb_sys 0.1.0 (git+https://github.com/pingcap/rust-rocksdb.git?branch=hhkbp2/add-delete-range)",
