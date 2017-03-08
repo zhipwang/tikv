@@ -31,7 +31,7 @@ use raftstore::store::peer_storage::{JOB_STATUS_FINISHED, JOB_STATUS_CANCELLED, 
 use raftstore::store::{self, check_abort, SnapManager, SnapKey, SnapEntry, ApplyContext, keys,
                        Peekable};
 use raftstore::store::snap::{Error, Result};
-use storage::CF_RAFT;
+use storage::{CF_RAFT, CF_WRITE, Key};
 
 use super::metrics::*;
 
@@ -131,9 +131,24 @@ impl Runner {
                            abort: &AtomicUsize)
                            -> Result<()> {
         for cf in self.db.cf_names() {
+            if cf == CF_RAFT {
+                // Skip `CF_RAFT` since there is no data in range [start_key, end_key) in this CF
+                continue;
+            }
             try!(check_abort(&abort));
             let handle = box_try!(rocksdb::get_cf_handle(&self.db, cf));
-            box_try!(self.db.delete_range_cf(handle, start_key, end_key));
+            if cf == CF_WRITE {
+                // Append ts to the end of `start_key` and `end_key` because the key arguments of
+                // `delete_range_cf()` should have tailing ts, and these keys are used by
+                // the prefix extractor of `CF_WRITE`.
+                let start_key_with_ts = Key::from_encoded(start_key.to_vec()).append_ts(0);
+                let end_key_with_ts = Key::from_encoded(end_key.to_vec()).append_ts(0);
+                box_try!(self.db.delete_range_cf(handle,
+                                                 &start_key_with_ts.encoded()[..],
+                                                 &end_key_with_ts.encoded()[..]));
+            } else {
+                box_try!(self.db.delete_range_cf(handle, start_key, end_key));
+            }
         }
         Ok(())
     }
