@@ -13,6 +13,7 @@
 
 use std::cmp;
 use std::io::Read;
+use std::time::Instant;
 
 use mio::{Token, EventLoop, EventSet, PollOpt};
 use mio::tcp::TcpStream;
@@ -23,6 +24,7 @@ use kvproto::raft_serverpb::RaftSnapshotData;
 use super::{Result, ConnData};
 use super::server::Server;
 use util::codec::rpc;
+use util;
 use super::transport::RaftStoreRouter;
 use super::resolve::StoreAddrResolver;
 use super::snap::Task as SnapTask;
@@ -63,6 +65,9 @@ pub struct Conn {
     send_buffer: PipeBuffer,
     recv_buffer: Option<PipeBuffer>,
 
+    written_bytes: usize,
+    last_record: Option<Instant>,
+
     pub buffer_shrink_threshold: usize,
 }
 
@@ -84,6 +89,8 @@ impl Conn {
             // TODO: Maybe we should need max size to shrink later.
             send_buffer: PipeBuffer::new(DEFAULT_SEND_BUFFER_SIZE),
             recv_buffer: Some(PipeBuffer::new(DEFAULT_RECV_BUFFER_SIZE)),
+            written_bytes: 0,
+            last_record: None,
             buffer_shrink_threshold: DEFAULT_BUFFER_SHRINK_THRESHOLD,
         }
     }
@@ -94,6 +101,16 @@ impl Conn {
                 error!("failed to cleanup snapshot: {:?}", e);
             }
         }
+        if let Some(timer) = self.last_record {
+            let sec = util::duration_to_sec(timer.elapsed());
+            info!("last write speed for {:?} is {}",
+                  self.token,
+                  self.written_bytes as f64 / sec);
+        }
+    }
+
+    pub fn pending_bytes_count(&self) -> usize {
+        self.send_buffer.len()
     }
 
     pub fn reregister<T, S>(&mut self, event_loop: &mut EventLoop<Server<T, S>>) -> Result<()>
@@ -242,15 +259,15 @@ impl Conn {
         Ok(())
     }
 
-    pub fn on_writable<T, S>(&mut self, event_loop: &mut EventLoop<Server<T, S>>) -> Result<()>
+    pub fn on_writable<T, S>(&mut self, event_loop: &mut EventLoop<Server<T, S>>) -> Result<usize>
         where T: RaftStoreRouter,
               S: StoreAddrResolver
     {
-        try!(self.send_buffer.write_to(&mut self.sock));
+        let written = try!(self.send_buffer.write_to(&mut self.sock));
         if !self.send_buffer.is_empty() {
             // we don't write all data, so must try later.
             // we have already registered writable, no need registering again.
-            return Ok(());
+            return Ok(written);
         }
 
         // no data for writing, remove writable
@@ -260,18 +277,20 @@ impl Conn {
         self.interest.remove(EventSet::writable());
         try!(self.reregister(event_loop));
 
-        Ok(())
+        Ok(written)
     }
 
 
     pub fn append_write_buf<T, S>(&mut self,
                                   event_loop: &mut EventLoop<Server<T, S>>,
                                   msg: ConnData)
-                                  -> Result<()>
+                                  -> Result<usize>
         where T: RaftStoreRouter,
               S: StoreAddrResolver
     {
+        let last_len = self.send_buffer.len();
         msg.encode_to(&mut self.send_buffer).unwrap();
+        let appended = self.send_buffer.len() - last_len;
 
         if !self.interest.is_writable() {
             // re-register writable if we have not,
@@ -281,6 +300,6 @@ impl Conn {
             try!(self.reregister(event_loop));
         }
 
-        Ok(())
+        Ok(appended)
     }
 }

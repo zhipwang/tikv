@@ -15,6 +15,7 @@ use std::option::Option;
 use std::sync::mpsc::Sender;
 use std::boxed::Box;
 use std::net::SocketAddr;
+use std::time::{Instant, Duration};
 
 use mio::{Token, Handler, EventLoop, EventLoopBuilder, EventSet, PollOpt};
 use mio::tcp::{TcpListener, TcpStream};
@@ -42,6 +43,7 @@ use super::metrics::*;
 const SERVER_TOKEN: Token = Token(1);
 const FIRST_CUSTOM_TOKEN: Token = Token(1024);
 const DEFAULT_COPROCESSOR_BATCH: usize = 50;
+const MAX_PENDING_BYTES: usize = 1 * 1024 * 1024 * 1024; // 1G
 
 pub fn create_event_loop<T, S>(config: &Config) -> Result<EventLoop<Server<T, S>>>
     where T: RaftStoreRouter,
@@ -96,6 +98,10 @@ pub struct Server<T: RaftStoreRouter + 'static, S: StoreAddrResolver> {
     resolver: S,
 
     cfg: Config,
+
+    pending_bytes: usize,
+    last_warn: Option<Instant>,
+    last_exceed: Instant,
 }
 
 impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
@@ -136,6 +142,9 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
             snap_worker: snap_worker,
             resolver: resolver,
             cfg: cfg.clone(),
+            pending_bytes: 0,
+            last_warn: None,
+            last_exceed: Instant::now(),
         };
 
         Ok(svr)
@@ -175,6 +184,7 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
         match conn {
             Some(mut conn) => {
                 debug!("remove connection token {:?}", token);
+                self.pending_bytes -= conn.pending_bytes_count();
                 // if connected to remote store, remove this too.
                 if let Some(store_id) = conn.store_id {
                     warn!("remove store connection for store {} with token {:?}",
@@ -346,9 +356,25 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
             Some(conn) => conn.on_writable(event_loop),
         };
 
-        if let Err(e) = res {
-            debug!("handle write conn err {:?}, remove", e);
-            self.remove_conn(event_loop, token);
+        match res {
+            Err(e) => {
+                debug!("handle write conn err {:?}, remove", e);
+                self.remove_conn(event_loop, token);
+            }
+            Ok(written) => {
+                self.pending_bytes -= written;
+                if self.last_warn.is_none() {
+                    return;
+                }
+                if self.pending_bytes >= MAX_PENDING_BYTES {
+                    return;
+                }
+                let elapsed = self.last_exceed.elapsed();
+                info!("pending bytes are flushed to {} after {:?}",
+                      self.pending_bytes,
+                      elapsed);
+                self.last_warn = None;
+            }
         }
     }
 
@@ -361,9 +387,25 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
             Some(conn) => conn.append_write_buf(event_loop, data),
         };
 
-        if let Err(e) = res {
-            debug!("handle write data err {:?}, remove", e);
-            self.remove_conn(event_loop, token);
+        match res {
+            Ok(appended) => {
+                self.pending_bytes += appended;
+                if self.pending_bytes <= MAX_PENDING_BYTES {
+                    return;
+                }
+                if self.last_warn.is_none() {
+                    self.last_exceed = Instant::now();
+                }
+                if self.last_warn.map_or(false, |t| t.elapsed() <= Duration::from_secs(2)) {
+                    return;
+                }
+                self.last_warn = Some(Instant::now());
+                warn!("there are {} pending bytes", self.pending_bytes);
+            }
+            Err(e) => {
+                debug!("handle write data err {:?}, remove", e);
+                self.remove_conn(event_loop, token);
+            }
         }
     }
 
