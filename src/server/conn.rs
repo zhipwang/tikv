@@ -68,6 +68,8 @@ pub struct Conn {
     written_bytes: usize,
     last_record: Option<Instant>,
 
+    sent_count: usize,
+
     pub buffer_shrink_threshold: usize,
 }
 
@@ -91,6 +93,7 @@ impl Conn {
             recv_buffer: Some(PipeBuffer::new(DEFAULT_RECV_BUFFER_SIZE)),
             written_bytes: 0,
             last_record: None,
+            sent_count: 0,
             buffer_shrink_threshold: DEFAULT_BUFFER_SHRINK_THRESHOLD,
         }
     }
@@ -233,6 +236,16 @@ impl Conn {
         }
         let mut msg = Message::new();
         try!(rpc::decode_body(&mut recv_buffer.take(self.expect_size as u64), &mut msg));
+
+        if msg.has_send_time() {
+            let now = util::now();
+            if now - msg.get_send_time() >= 1f64 {
+                warn!("{:?} latency {} seems too large",
+                      self.token,
+                      now - msg.get_send_time());
+            }
+        }
+
         let msg_id = self.last_msg_id.unwrap();
         self.last_msg_id = None;
         Ok(Some(ConnData {
@@ -283,11 +296,17 @@ impl Conn {
 
     pub fn append_write_buf<T, S>(&mut self,
                                   event_loop: &mut EventLoop<Server<T, S>>,
-                                  msg: ConnData)
+                                  mut msg: ConnData)
                                   -> Result<usize>
         where T: RaftStoreRouter,
               S: StoreAddrResolver
     {
+        if (self.sent_count & 1023) == 0 {
+            msg.msg.set_send_time(util::now());
+        }
+
+        self.sent_count += 1;
+
         let last_len = self.send_buffer.len();
         msg.encode_to(&mut self.send_buffer).unwrap();
         let appended = self.send_buffer.len() - last_len;

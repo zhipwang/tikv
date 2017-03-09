@@ -23,6 +23,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use prometheus;
 use rand::{self, ThreadRng};
 use protobuf::Message;
+use time;
 
 #[macro_use]
 pub mod macros;
@@ -279,6 +280,11 @@ impl<'a, T: 'a, V: 'a, E> TryInsertWith<'a, V, E> for Entry<'a, T, V> {
             }
         }
     }
+}
+
+pub fn now() -> f64 {
+    let t = time::now().to_timespec();
+    t.sec as f64 + (t.nsec as f64 / 1_000_000_000f64)
 }
 
 /// Convert Duration to milliseconds.
