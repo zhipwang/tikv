@@ -143,11 +143,13 @@ impl Runner {
                 // the prefix extractor of `CF_WRITE`.
                 let start_key_with_ts = Key::from_encoded(start_key.to_vec()).append_ts(0);
                 let end_key_with_ts = Key::from_encoded(end_key.to_vec()).append_ts(0);
-                box_try!(self.db.delete_range_cf(handle,
-                                                 &start_key_with_ts.encoded()[..],
-                                                 &end_key_with_ts.encoded()[..]));
+                let range_start_key = &start_key_with_ts.encoded()[..];
+                let range_end_key = &end_key_with_ts.encoded()[..];
+                box_try!(self.db.delete_range_cf(handle, range_start_key, range_end_key));
+                self.db.compact_range_cf(handle, Some(range_start_key), Some(range_end_key));
             } else {
                 box_try!(self.db.delete_range_cf(handle, start_key, end_key));
+                self.db.compact_range_cf(handle, Some(start_key), Some(end_key));
             }
         }
         Ok(())
