@@ -452,12 +452,13 @@ impl<T: Simulator> Cluster<T> {
             }
 
             let resp = result.unwrap();
-            if resp.get_header().get_error().has_stale_epoch() {
-                warn!("seems split, let's retry");
-                sleep_ms(100);
-                continue;
+            if !resp.get_header().get_error().has_key_not_in_region() &&
+               !resp.get_header().get_error().has_stale_epoch() {
+                return resp;
             }
-            return resp;
+
+            warn!("seems split, let's retry");
+            sleep_ms(100);
         }
         panic!("request failed after retry for 20 times");
     }

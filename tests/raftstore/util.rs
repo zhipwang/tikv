@@ -151,6 +151,12 @@ pub fn new_get_cmd(key: &[u8]) -> Request {
     cmd
 }
 
+pub fn new_snap_cmd() -> Request {
+    let mut cmd = Request::new();
+    cmd.set_cmd_type(CmdType::Snap);
+    cmd
+}
+
 pub fn new_delete_cmd(cf: &str, key: &[u8]) -> Request {
     let mut cmd = Request::new();
     cmd.set_cmd_type(CmdType::Delete);

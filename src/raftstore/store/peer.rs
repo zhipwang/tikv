@@ -1320,8 +1320,12 @@ pub fn check_epoch(region: &metapb::Region, req: &RaftCmdRequest) -> Result<()> 
             }
         };
     } else {
-        // for get/set/delete, we don't care conf_version.
-        check_ver = true;
+        for req in req.get_requests() {
+            if req.get_cmd_type() == CmdType::Snap {
+                // when split, ranges change, snapshot is not consistent with the origin ranges.
+                check_ver = true;
+            }
+        }
     }
 
     if !check_ver && !check_conf_ver {
