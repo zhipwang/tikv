@@ -1318,7 +1318,7 @@ impl Peer {
     }
 }
 
-pub fn check_epoch(region: &metapb::Region, req: &RaftCmdRequest) -> Result<()> {
+pub fn check_epoch(region: &metapb::Region, req: &RaftCmdRequest) -> Result<bool> {
     let (mut check_ver, mut check_conf_ver) = (false, false);
     if req.has_admin_request() {
         match req.get_admin_request().get_cmd_type() {
@@ -1339,7 +1339,7 @@ pub fn check_epoch(region: &metapb::Region, req: &RaftCmdRequest) -> Result<()> 
     }
 
     if !check_ver && !check_conf_ver {
-        return Ok(());
+        return Ok(true);
     }
 
     if !req.get_header().has_region_epoch() {
@@ -1352,19 +1352,30 @@ pub fn check_epoch(region: &metapb::Region, req: &RaftCmdRequest) -> Result<()> 
     // should we use not equal here?
     if (check_conf_ver && from_epoch.get_conf_ver() < latest_epoch.get_conf_ver()) ||
        (check_ver && from_epoch.get_version() < latest_epoch.get_version()) {
-        debug!("[region {}] received stale epoch {:?}, mime: {:?}",
+        debug!("[region {}] received stale epoch {:?}, mine: {:?}",
                region.get_id(),
                from_epoch,
                latest_epoch);
+
+        if req.get_header().has_key_range() {
+            let range = req.get_header().get_key_range();
+            if range.get_min_key() >= region.get_start_key() &&
+               range.get_max_key() < region.get_end_key() {
+                debug!("{} accept stale epoch {:?} after check key range",
+                       region.get_id(),
+                       from_epoch);
+                return Ok(false);
+            }
+        }
+
         return Err(Error::StaleEpoch(format!("latest_epoch of region {} is {:?}, but you \
                                                 sent {:?}",
                                              region.get_id(),
                                              latest_epoch,
-                                             from_epoch),
-                                     vec![region.to_owned()]));
+                                             from_epoch)));
     }
 
-    Ok(())
+    Ok(true)
 }
 
 impl Peer {

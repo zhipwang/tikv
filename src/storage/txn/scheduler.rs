@@ -114,40 +114,41 @@ impl Debug for Msg {
 }
 
 /// Delivers the process result of a command to the storage callback.
-fn execute_callback(callback: StorageCb, pr: ProcessResult) {
+fn execute_callback(callback: StorageCb, cb_ctx: Option<CbContext>, pr: ProcessResult) {
+    let cb_ctx = cb_ctx.unwrap_or_default();
     match callback {
         StorageCb::Boolean(cb) => {
             match pr {
-                ProcessResult::Res => cb(Ok(())),
-                ProcessResult::Failed { err } => cb(Err(err)),
+                ProcessResult::Res => cb((cb_ctx, Ok(()))),
+                ProcessResult::Failed { err } => cb((cb_ctx, Err(err))),
                 _ => panic!("process result mismatch"),
             }
         }
         StorageCb::Booleans(cb) => {
             match pr {
-                ProcessResult::MultiRes { results } => cb(Ok(results)),
-                ProcessResult::Failed { err } => cb(Err(err)),
+                ProcessResult::MultiRes { results } => cb((cb_ctx, Ok(results))),
+                ProcessResult::Failed { err } => cb((cb_ctx, Err(err))),
                 _ => panic!("process result mismatch"),
             }
         }
         StorageCb::SingleValue(cb) => {
             match pr {
-                ProcessResult::Value { value } => cb(Ok(value)),
-                ProcessResult::Failed { err } => cb(Err(err)),
+                ProcessResult::Value { value } => cb((cb_ctx, Ok(value))),
+                ProcessResult::Failed { err } => cb((cb_ctx, Err(err))),
                 _ => panic!("process result mismatch"),
             }
         }
         StorageCb::KvPairs(cb) => {
             match pr {
-                ProcessResult::MultiKvpairs { pairs } => cb(Ok(pairs)),
-                ProcessResult::Failed { err } => cb(Err(err)),
+                ProcessResult::MultiKvpairs { pairs } => cb((cb_ctx, Ok(pairs))),
+                ProcessResult::Failed { err } => cb((cb_ctx, Err(err))),
                 _ => panic!("process result mismatch"),
             }
         }
         StorageCb::Locks(cb) => {
             match pr {
-                ProcessResult::Locks { locks } => cb(Ok(locks)),
-                ProcessResult::Failed { err } => cb(Err(err)),
+                ProcessResult::Locks { locks } => cb((cb_ctx, Ok(locks))),
+                ProcessResult::Failed { err } => cb((cb_ctx, Err(err))),
                 _ => panic!("process result mismatch"),
             }
         }
@@ -160,6 +161,7 @@ pub struct RunningCtx {
     cmd: Option<Command>,
     lock: Lock,
     callback: Option<StorageCb>,
+    cb_ctx: Option<CbContext>,
     tag: &'static str,
     ts: u64,
     region_id: u64,
@@ -179,6 +181,7 @@ impl RunningCtx {
             cmd: Some(cmd),
             lock: lock,
             callback: Some(cb),
+            cb_ctx: None,
             tag: tag,
             ts: ts,
             region_id: region_id,
@@ -611,14 +614,16 @@ impl Scheduler {
     fn process_by_worker(&mut self, cid: u64, cb_ctx: CbContext, snapshot: Box<Snapshot>) {
         SCHED_STAGE_COUNTER_VEC.with_label_values(&[self.get_ctx_tag(cid), "process"]).inc();
         debug!("process cmd with snapshot, cid={}", cid);
-        let mut cmd = {
-            let ctx = &mut self.cmd_ctxs.get_mut(&cid).unwrap();
+        let cmd = {
+            let mut ctx = &mut self.cmd_ctxs.get_mut(&cid).unwrap();
             assert_eq!(ctx.cid, cid);
-            ctx.cmd.take().unwrap()
+            let mut cmd = ctx.cmd.take().unwrap();
+            if let Some(term) = cb_ctx.term {
+                cmd.mut_context().set_term(term);
+            }
+            ctx.cb_ctx = Some(cb_ctx);
+            cmd
         };
-        if let Some(term) = cb_ctx.term {
-            cmd.mut_context().set_term(term);
-        }
         let ch = self.schedch.clone();
         let readcmd = cmd.readonly();
         if readcmd {
@@ -635,8 +640,9 @@ impl Scheduler {
 
         let mut ctx = self.remove_ctx(cid);
         let cb = ctx.callback.take().unwrap();
+        let cb_ctx = ctx.cb_ctx.take();
         let pr = ProcessResult::Failed { err: StorageError::from(err) };
-        execute_callback(cb, pr);
+        execute_callback(cb, cb_ctx, pr);
 
         self.release_lock(&ctx.lock, cid);
     }
@@ -672,11 +678,12 @@ impl Scheduler {
         self.running_write_count >= self.sched_too_busy_threshold
     }
 
-    fn on_receive_new_cmd(&mut self, cmd: Command, callback: StorageCb) {
+    fn on_receive_new_cmd(&mut self, mut cmd: Command, callback: StorageCb) {
         // write flow control
         if !cmd.readonly() && self.too_busy() {
             SCHED_TOO_BUSY_COUNTER_VEC.with_label_values(&[cmd.tag()]).inc();
             execute_callback(callback,
+                             None,
                              ProcessResult::Failed { err: StorageError::SchedTooBusy });
             return;
         }
@@ -684,9 +691,15 @@ impl Scheduler {
         if cmd.tag() == CMD_TAG_GC && self.has_gc_command {
             SCHED_TOO_BUSY_COUNTER_VEC.with_label_values(&[cmd.tag()]).inc();
             execute_callback(callback,
+                             None,
                              ProcessResult::Failed { err: StorageError::SchedTooBusy });
             return;
 
+        }
+        if let Some((min, max)) = cmd.key_range() {
+            let mut r = cmd.mut_context().mut_key_range();
+            r.set_min_key(min.encoded().to_owned());
+            r.set_max_key(max.encoded().to_owned());
         }
         self.schedule_command(cmd, callback);
     }
@@ -759,11 +772,12 @@ impl Scheduler {
         let mut ctx = self.remove_ctx(cid);
         SCHED_STAGE_COUNTER_VEC.with_label_values(&[ctx.tag, "read_finish"]).inc();
         let cb = ctx.callback.take().unwrap();
+        let cb_ctx = ctx.cb_ctx.take();
         if let ProcessResult::NextCommand { cmd } = pr {
             SCHED_STAGE_COUNTER_VEC.with_label_values(&[ctx.tag, "next_cmd"]).inc();
             self.schedule_command(cmd, cb);
         } else {
-            execute_callback(cb, pr);
+            execute_callback(cb, cb_ctx, pr);
         }
 
         self.release_lock(&ctx.lock, cid);
@@ -807,6 +821,7 @@ impl Scheduler {
         debug!("write finished for command, cid={}", cid);
         let mut ctx = self.remove_ctx(cid);
         let cb = ctx.callback.take().unwrap();
+        let cb_ctx = ctx.cb_ctx.take();
         let pr = match result {
             Ok(()) => pr,
             Err(e) => ProcessResult::Failed { err: ::storage::Error::from(e) },
@@ -815,7 +830,7 @@ impl Scheduler {
             SCHED_STAGE_COUNTER_VEC.with_label_values(&[ctx.tag, "next_cmd"]).inc();
             self.schedule_command(cmd, cb);
         } else {
-            execute_callback(cb, pr);
+            execute_callback(cb, cb_ctx, pr);
         }
 
         self.release_lock(&ctx.lock, cid);

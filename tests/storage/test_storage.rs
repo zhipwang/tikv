@@ -19,7 +19,7 @@ use std::thread;
 use rand::random;
 use super::sync_storage::SyncStorage;
 use kvproto::kvrpcpb::{Context, LockInfo};
-use tikv::storage::{self, Mutation, Key, make_key, ALL_CFS, Storage};
+use tikv::storage::{self, Mutation, Key, make_key, ALL_CFS, Storage, CbContext};
 use tikv::storage::engine::{self, TEMP_DIR, Engine};
 use tikv::storage::txn::{GC_BATCH_SIZE, RESOLVE_LOCK_BATCH_SIZE};
 use tikv::storage::mvcc::MAX_TXN_WRITE_SIZE;
@@ -659,7 +659,7 @@ fn test_storage_1gc_with_engine(engine: Box<Engine>, ctx: Context) {
     let (tx1, rx1) = channel();
     storage.async_gc(ctx.clone(),
                   1,
-                  box move |res: storage::Result<()>| {
+                  box move |(_, res): (CbContext, storage::Result<()>)| {
                       assert!(res.is_ok());
                       tx1.send(1).unwrap();
                   })
@@ -669,7 +669,7 @@ fn test_storage_1gc_with_engine(engine: Box<Engine>, ctx: Context) {
     let (tx2, rx2) = channel();
     storage.async_gc(Context::new(),
                   1,
-                  box move |res: storage::Result<()>| {
+                  box move |(_, res): (CbContext, storage::Result<()>)| {
             match res {
                 Err(storage::Error::SchedTooBusy) => {}
                 _ => panic!("expect too busy"),
@@ -682,6 +682,7 @@ fn test_storage_1gc_with_engine(engine: Box<Engine>, ctx: Context) {
     engine.unblock_snapshot();
     rx1.recv().unwrap();
 }
+
 #[test]
 fn test_storage_1gc() {
     let engine = engine::new_local_engine(TEMP_DIR, ALL_CFS).unwrap();

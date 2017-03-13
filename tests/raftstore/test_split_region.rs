@@ -16,7 +16,7 @@ use std::{thread, fs};
 use rand::{self, Rng};
 
 use kvproto::eraftpb::MessageType;
-
+use kvproto::metapb;
 use super::cluster::{Cluster, Simulator};
 use super::node::new_node_cluster;
 use super::server::new_server_cluster;
@@ -533,8 +533,9 @@ fn test_split_stale_epoch<T: Simulator>(cluster: &mut Cluster<T>) {
     let resp = cluster.call_command_on_leader(get, Duration::from_secs(5)).unwrap();
     assert!(resp.get_header().has_error());
     assert!(resp.get_header().get_error().has_stale_epoch());
-    assert_eq!(resp.get_header().get_error().get_stale_epoch().get_new_regions(),
-               &[left, right]);
+    let updated_regions: Vec<&metapb::Region> =
+        resp.get_header().get_updated_regions().iter().map(|r| r.get_region()).collect();
+    assert_eq!(updated_regions, vec![&left, &right]);
 }
 
 #[test]
@@ -548,7 +549,6 @@ fn test_node_split_stale_epoch() {
     let mut cluster = new_node_cluster(0, 3);
     test_split_stale_epoch(&mut cluster);
 }
-
 
 // For the peer which is the leader of the region before split,
 // it would accelerate ticks for the peer of new region after split, so that the peer of new region
@@ -590,4 +590,51 @@ fn test_node_tick_acceleration_after_split() {
 fn test_server_tick_acceleration_after_split() {
     let mut cluster = new_server_cluster(0, 3);
     test_tick_acceleration_after_split(&mut cluster);
+}
+
+fn test_split_stale_epoch_key_range<T: Simulator>(cluster: &mut Cluster<T>) {
+    cluster.run();
+    let pd_client = cluster.pd_client.clone();
+    let old = pd_client.get_region(b"k1").unwrap();
+    cluster.must_split(&old, b"k2");
+    let left = pd_client.get_region(b"k1").unwrap();
+    let right = pd_client.get_region(b"k3").unwrap();
+
+    // Send 2 get commands that belong to different regions.
+    let mut get = util::new_request(old.get_id(),
+                                    old.get_region_epoch().clone(),
+                                    vec![util::new_get_cmd(b"k1")],
+                                    false);
+    get.mut_header().mut_key_range().set_min_key(b"k".to_vec());
+    get.mut_header().mut_key_range().set_max_key(b"k1".to_vec());
+    let resp = cluster.call_command_on_leader(get.clone(), Duration::from_secs(5)).unwrap();
+    assert!(!resp.get_header().has_error());
+    let updated_regions: Vec<&metapb::Region> =
+        resp.get_header().get_updated_regions().iter().map(|r| r.get_region()).collect();
+    assert_eq!(updated_regions, vec![&left]);
+
+    get = util::new_request(old.get_id(),
+                            old.get_region_epoch().clone(),
+                            vec![util::new_get_cmd(b"k2")],
+                            false);
+    get.mut_header().mut_key_range().set_min_key(b"k2".to_vec());
+    get.mut_header().mut_key_range().set_max_key(b"k3".to_vec());
+    let resp = cluster.call_command_on_leader(get.clone(), Duration::from_secs(5)).unwrap();
+    assert!(resp.get_header().has_error());
+    assert!(resp.get_header().get_error().has_stale_epoch());
+    let updated_regions: Vec<&metapb::Region> =
+        resp.get_header().get_updated_regions().iter().map(|r| r.get_region()).collect();
+    assert_eq!(updated_regions, vec![&left, &right]);
+}
+
+#[test]
+fn test_server_stale_epoch_key_range() {
+    let mut cluster = new_server_cluster(0, 3);
+    test_split_stale_epoch_key_range(&mut cluster);
+}
+
+#[test]
+fn test_node_stale_epoch_key_range() {
+    let mut cluster = new_node_cluster(0, 3);
+    test_split_stale_epoch_key_range(&mut cluster);
 }
