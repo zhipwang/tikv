@@ -16,9 +16,8 @@ use std::time::Duration;
 use std::thread;
 use tikv::util::HandyRwLock;
 use tikv::storage::config::Config;
-use tikv::storage::{self, txn, Storage, Engine, Snapshot, Modify, Mutation, Options, make_key,
-                    ALL_CFS};
-use tikv::storage::engine::{self, Callback, Result, CbContext};
+use tikv::storage::{self, txn, Storage, Engine, Mutation, Options, make_key, ALL_CFS};
+use tikv::storage::engine::{self, CbContext};
 use kvproto::kvrpcpb::Context;
 use raftstore::server::new_server_cluster_with_cfs;
 use raftstore::cluster::Cluster;

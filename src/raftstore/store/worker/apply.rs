@@ -27,7 +27,8 @@ use kvproto::metapb::{Peer as PeerMeta, Region};
 use kvproto::eraftpb::{Entry, EntryType, ConfChange, ConfChangeType};
 use kvproto::raft_serverpb::{RaftApplyState, RaftTruncatedState, PeerState};
 use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, ChangePeerRequest, CmdType,
-                          AdminCmdType, Request, Response, AdminRequest, AdminResponse};
+                          AdminCmdType, Request, Response, AdminRequest, AdminResponse,
+                          UpdatedRegion};
 
 use util::worker::Runnable;
 use util::{SlowTimer, rocksdb, escape};
@@ -362,10 +363,19 @@ impl ApplyDelegate {
             // clear dirty values.
             ctx.wb.clear();
             match e {
-                Error::StaleEpoch(..) => info!("{} stale epoch err: {:?}", self.tag, e),
-                _ => error!("{} execute raft command err: {:?}", self.tag, e),
+                Error::StaleEpoch(..) => {
+                    info!("{} stale epoch err: {:?}", self.tag, e);
+                    let mut resp = cmd_resp::new_error(e);
+                    let mut updated_region = UpdatedRegion::new();
+                    updated_region.set_region(self.region.clone());
+                    cmd_resp::bind_updated_regions(&mut resp, vec![updated_region]);
+                    (resp, None)
+                }
+                _ => {
+                    error!("{} execute raft command err: {:?}", self.tag, e);
+                    (cmd_resp::new_error(e), None)
+                }
             }
-            (cmd_resp::new_error(e), None)
         });
 
         ctx.apply_state.set_applied_index(index);
@@ -478,13 +488,19 @@ impl ApplyDelegate {
     fn exec_raft_cmd(&mut self,
                      ctx: &mut ExecContext)
                      -> Result<(RaftCmdResponse, Option<ExecResult>)> {
-        try!(check_epoch(&self.region, ctx.req));
-        if ctx.req.has_admin_request() {
-            self.exec_admin_cmd(ctx)
+        let valid = try!(check_epoch(&self.region, ctx.req));
+        let (mut resp, res) = if ctx.req.has_admin_request() {
+            try!(self.exec_admin_cmd(ctx))
         } else {
             // Now we don't care write command outer, so use None.
-            self.exec_write_cmd(ctx).and_then(|v| Ok((v, None)))
+            try!(self.exec_write_cmd(ctx).and_then(|v| Ok((v, None))))
+        };
+        if !valid {
+            let mut updated_region = UpdatedRegion::new();
+            updated_region.set_region(self.region.clone());
+            cmd_resp::bind_updated_regions(&mut resp, vec![updated_region]);
         }
+        Ok((resp, res))
     }
 
     fn exec_admin_cmd(&mut self,

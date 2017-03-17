@@ -27,7 +27,7 @@ use uuid::Uuid;
 use kvproto::metapb;
 use kvproto::eraftpb::{self, ConfChangeType, MessageType};
 use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, CmdType, AdminCmdType, AdminResponse,
-                          TransferLeaderRequest, TransferLeaderResponse};
+                          TransferLeaderRequest, TransferLeaderResponse, UpdatedRegion};
 use kvproto::raft_serverpb::{RaftMessage, PeerState};
 use kvproto::pdpb::PeerStats;
 
@@ -1484,7 +1484,7 @@ impl Peer {
     }
 
     fn exec_read(&mut self, req: &RaftCmdRequest) -> Result<RaftCmdResponse> {
-        try!(check_epoch(self.region(), req));
+        let valid = try!(check_epoch(self.region(), req));
         let snap = Snapshot::new(self.engine.clone());
         let requests = req.get_requests();
         let mut responses = Vec::with_capacity(requests.len());
@@ -1504,6 +1504,16 @@ impl Peer {
 
         let mut resp = RaftCmdResponse::new();
         resp.set_responses(protobuf::RepeatedField::from_vec(responses));
+        if !valid {
+            let mut updated_region = UpdatedRegion::new();
+            updated_region.set_region(self.region().to_owned());
+            for peer in self.region().get_peers() {
+                if peer.get_id() == self.leader_id() {
+                    updated_region.set_leader(peer.to_owned());
+                }
+            }
+            cmd_resp::bind_updated_regions(&mut resp, vec![updated_region]);
+        }
         Ok(resp)
     }
 }

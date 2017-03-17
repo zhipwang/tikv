@@ -1261,29 +1261,40 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         }
 
         let res = peer::check_epoch(peer.region(), msg);
-        match res {
-            Err(Error::StaleEpoch(_)) |
-            Ok(false) => {
-                // Attach all regions that overlaps with `key_range` to let TiKV driver update its
-                // cache.
-                let key_range = msg.get_header().get_key_range();
-                for (_, region_id) in self.region_ranges
-                    .range((Excluded(keys::data_end_key(key_range.get_min_key())),
-                            Unbounded::<Key>)) {
-                    let peer = &self.region_peers[region_id];
-                    if peer.region().get_start_key() > key_range.get_max_key() {
-                        break;
-                    }
-                    let mut updated_region = UpdatedRegion::new();
-                    updated_region.set_region(peer.region().to_owned());
-                    if let Some(p) = peer.get_peer_from_cache(peer.leader_id()) {
-                        updated_region.set_leader(p);
-                    }
-                    updated_regions.push(updated_region);
+
+        if let Ok(true) = res {
+            return Ok(());
+        }
+
+        // Attach all regions that overlaps with `key_range` to let TiKV driver update its
+        // cache.
+        if msg.get_header().has_key_range() {
+            let key_range = msg.get_header().get_key_range();
+            for (_, region_id) in self.region_ranges
+                .range((Excluded(keys::data_end_key(key_range.get_min_key())), Unbounded::<Key>)) {
+                let peer = &self.region_peers[region_id];
+                if peer.region().get_start_key() > key_range.get_max_key() {
+                    break;
+                }
+                let mut updated_region = UpdatedRegion::new();
+                updated_region.set_region(peer.region().to_owned());
+                if let Some(p) = peer.get_peer_from_cache(peer.leader_id()) {
+                    updated_region.set_leader(p);
+                }
+                updated_regions.push(updated_region);
+            }
+        } else {
+            let mut updated_region = UpdatedRegion::new();
+            updated_region.set_region(peer.region().to_owned());
+            for p in peer.region().get_peers() {
+                if p.get_id() == peer.leader_id() {
+                    updated_region.set_leader(p.to_owned());
+                    break;
                 }
             }
-            _ => {}
+            updated_regions.push(updated_region);
         }
+
         res.map(|_| ())
     }
 
