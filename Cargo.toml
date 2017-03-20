@@ -65,6 +65,9 @@ signal = "0.2"
 [dependencies.rocksdb]
 git = "https://github.com/pingcap/rust-rocksdb.git"
 
+[dependencies.rtrie]
+git = "https://github.com/busyjay/rtrie.git"
+
 [dependencies.kvproto]
 git = "https://github.com/pingcap/kvproto"
 

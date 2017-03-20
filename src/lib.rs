@@ -31,6 +31,7 @@
 extern crate log;
 #[macro_use]
 extern crate quick_error;
+extern crate rtrie;
 extern crate test;
 extern crate protobuf;
 extern crate bytes;

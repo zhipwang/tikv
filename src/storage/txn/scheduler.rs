@@ -258,7 +258,7 @@ impl Scheduler {
             cmd_ctxs: Default::default(),
             schedch: schedch,
             id_alloc: 0,
-            latches: Latches::new(concurrency),
+            latches: Latches::new(),
             sched_too_busy_threshold: sched_too_busy_threshold,
             worker_pool: ThreadPool::new_with_name(thd_name!("sched-worker-pool"),
                                                    worker_pool_size),
@@ -851,13 +851,14 @@ impl Scheduler {
 pub fn gen_command_lock(latches: &Latches, cmd: &Command) -> Lock {
     match *cmd {
         Command::Prewrite { ref mutations, .. } => {
-            let keys: Vec<&Key> = mutations.iter().map(|x| x.key()).collect();
-            latches.gen_lock(&keys)
+            latches.gen_lock(mutations.iter().map(|x| x.key().encoded().to_owned()).collect())
         }
         Command::Commit { ref keys, .. } |
         Command::Rollback { ref keys, .. } |
-        Command::ResolveLock { ref keys, .. } => latches.gen_lock(keys),
-        Command::Cleanup { ref key, .. } => latches.gen_lock(&[key]),
+        Command::ResolveLock { ref keys, .. } => {
+            latches.gen_lock(keys.iter().map(|k| k.encoded().to_owned()).collect())
+        }
+        Command::Cleanup { ref key, .. } => latches.gen_lock(vec![key.encoded().to_owned()]),
         _ => Lock::new(vec![]),
     }
 }
@@ -966,7 +967,7 @@ mod tests {
                                   keys: vec![make_key(b"k")],
                               }];
 
-        let mut latches = Latches::new(1024);
+        let mut latches = Latches::new();
 
         let write_locks: Vec<Lock> = write_cmds.into_iter()
             .enumerate()
