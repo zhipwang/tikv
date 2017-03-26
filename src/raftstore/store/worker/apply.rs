@@ -15,7 +15,6 @@
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
-use std::fmt::{self, Display, Formatter};
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry as MapEntry;
 
@@ -29,7 +28,6 @@ use kvproto::raft_serverpb::{RaftApplyState, RaftTruncatedState, PeerState};
 use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, ChangePeerRequest, CmdType,
                           AdminCmdType, Request, Response, AdminRequest, AdminResponse};
 
-use util::worker::Runnable;
 use util::{SlowTimer, rocksdb, escape};
 use storage::{CF_LOCK, CF_RAFT};
 use raftstore::{Result, Error};
@@ -953,12 +951,20 @@ pub struct Destroy {
     region_id: u64,
 }
 
+pub struct Removed {
+    region_id: u64,
+    peer_id: u64,
+}
+
 /// region related task.
 pub enum Task {
     Apply(Apply),
     Registration(Registration),
     Propose(Propose),
     Destroy(Destroy),
+    ApplyFinish(ApplyDelegate),
+    ApplyRemoved(Removed),
+    Shutdown,
 }
 
 impl Task {
@@ -994,17 +1000,20 @@ impl Task {
     pub fn destroy(region_id: u64) -> Task {
         Task::Destroy(Destroy { region_id: region_id })
     }
-}
 
-impl Display for Task {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    pub fn shutdown() -> Task {
+        Task::Shutdown
+    }
+
+    fn region_id(&self) -> u64 {
         match *self {
-            Task::Apply(ref a) => write!(f, "[region {}] async apply", a.region_id),
-            Task::Propose(ref p) => write!(f, "[region {}] propose", p.region_id),
-            Task::Registration(ref r) => {
-                write!(f, "[region {}] Reg {:?}", r.region.get_id(), r.apply_state)
-            }
-            Task::Destroy(ref d) => write!(f, "[region {}] destroy", d.region_id),
+            Task::Registration(ref reg) => reg.region.get_id(),
+            Task::Propose(ref prop) => prop.region_id,
+            Task::Apply(ref apply) => apply.region_id,
+            Task::Destroy(ref des) => des.region_id,
+            Task::ApplyFinish(ref d) => d.region_id(),
+            Task::ApplyRemoved(ref r) => r.region_id,
+            Task::Shutdown => unreachable!(),
         }
     }
 }
@@ -1035,129 +1044,286 @@ pub enum TaskRes {
     Destroy(ApplyDelegate),
 }
 
-// TODO: use threadpool to do task concurrently
+use futures_cpupool::{CpuPool, Builder as CpuPoolBuilder};
+use std::thread::Builder;
+use std::collections::hash_map::OccupiedEntry;
+use std::thread::JoinHandle;
+use tokio_core::reactor::{Core, Handle};
+use futures::Stream;
+use futures::sync::mpsc::{UnboundedSender, UnboundedReceiver};
+
+const APPLY_POOL_SIZE: usize = 2;
+
+struct ApplyDelegateQueue {
+    delegate: Option<ApplyDelegate>,
+    pending_tasks: Option<VecDeque<Task>>,
+}
+
+impl ApplyDelegateQueue {
+    fn new(delegate: ApplyDelegate) -> ApplyDelegateQueue {
+        ApplyDelegateQueue {
+            delegate: Some(delegate),
+            pending_tasks: Some(VecDeque::new()),
+        }
+    }
+}
+
 pub struct Runner {
     db: Arc<DB>,
-    delegates: HashMap<u64, ApplyDelegate>,
+    delegates: HashMap<u64, ApplyDelegateQueue>,
     notifier: Sender<TaskRes>,
+    pool: CpuPool,
 }
 
 impl Runner {
     pub fn new<T, C>(store: &Store<T, C>, notifier: Sender<TaskRes>) -> Runner {
         let mut delegates = HashMap::with_capacity(store.get_peers().len());
         for (&region_id, p) in store.get_peers() {
-            delegates.insert(region_id, ApplyDelegate::from_peer(p));
+            delegates.insert(region_id,
+                             ApplyDelegateQueue::new(ApplyDelegate::from_peer(p)));
         }
         Runner {
             db: store.engine(),
             delegates: delegates,
             notifier: notifier,
-        }
-    }
-
-    fn handle_apply(&mut self, apply: Apply) {
-        if apply.entries.is_empty() {
-            return;
-        }
-        let mut e = match self.delegates.entry(apply.region_id) {
-            MapEntry::Vacant(_) => {
-                error!("[region {}] is missing", apply.region_id);
-                return;
-            }
-            MapEntry::Occupied(e) => e,
-        };
-        {
-            let delegate = e.get_mut();
-            delegate.metrics = ApplyMetrics::default();
-            delegate.term = apply.term;
-            let results = delegate.handle_raft_committed_entries(apply.entries);
-
-            if delegate.pending_remove {
-                delegate.destroy();
-            }
-
-            self.notifier
-                .send(TaskRes::Apply(ApplyRes {
-                    region_id: apply.region_id,
-                    apply_state: delegate.apply_state.clone(),
-                    exec_res: results,
-                    metrics: delegate.metrics.clone(),
-                    applied_index_term: delegate.applied_index_term,
-                }))
-                .unwrap();
-        }
-        if e.get().pending_remove {
-            e.remove();
-        }
-    }
-
-    fn handle_propose(&mut self, p: Propose) {
-        let cmd = PendingCmd {
-            uuid: p.uuid,
-            term: p.term,
-            cb: Some(p.cb),
-        };
-        let delegate = match self.delegates.get_mut(&p.region_id) {
-            Some(d) => d,
-            None => {
-                notify_region_removed(p.region_id, p.id, cmd);
-                return;
-            }
-        };
-        assert_eq!(delegate.id, p.id);
-        if p.is_conf_change {
-            if let Some(cmd) = delegate.pending_cmds.take_conf_change() {
-                // if it loses leadership before conf change is replicated, there may be
-                // a stale pending conf change before next conf change is applied. If it
-                // becomes leader again with the stale pending conf change, will enter
-                // this block, so we notify leadership may have been changed.
-                notify_stale_command(&delegate.tag, delegate.term, cmd);
-            }
-            delegate.pending_cmds.set_conf_change(cmd);
-        } else {
-            delegate.pending_cmds.append_normal(cmd);
-        }
-    }
-
-    fn handle_registration(&mut self, s: Registration) {
-        let peer_id = s.id;
-        let region_id = s.region.get_id();
-        let term = s.term;
-        let delegate = ApplyDelegate::from_registration(self.db.clone(), s);
-        if let Some(mut old_delegate) = self.delegates.insert(region_id, delegate) {
-            assert_eq!(old_delegate.id, peer_id);
-            old_delegate.term = term;
-            old_delegate.clear_all_commands_as_stale();
-        }
-    }
-
-    fn handle_destroy(&mut self, d: Destroy) {
-        // Only respond when the meta exists. Otherwise if destroy is triggered
-        // multiple times, the store may destroy wrong target peer.
-        if let Some(mut meta) = self.delegates.remove(&d.region_id) {
-            meta.destroy();
-            self.notifier.send(TaskRes::Destroy(meta)).unwrap();
+            pool: CpuPoolBuilder::new()
+                .pool_size(APPLY_POOL_SIZE)
+                .name_prefix("apply-pool")
+                .create(),
         }
     }
 
     fn handle_shutdown(&mut self) {
         for p in self.delegates.values_mut() {
-            p.clear_pending_commands();
+            p.delegate.as_mut().unwrap().clear_pending_commands();
+            assert!(p.pending_tasks.as_ref().map_or(false, |q| q.is_empty()));
         }
+    }
+
+    // return true if a task has been scheduled to cpu pool.
+    fn handle_task(&mut self,
+                   region_id: u64,
+                   task: Task,
+                   handle: &Handle,
+                   sched: &mut Option<UnboundedSender<Task>>)
+                   -> bool {
+        match self.delegates.entry(region_id) {
+            MapEntry::Vacant(var) => {
+                match task {
+                    Task::Registration(s) => {
+                        let delegate = ApplyDelegate::from_registration(self.db.clone(), s);
+                        var.insert(ApplyDelegateQueue::new(delegate));
+                    }
+                    Task::Propose(prop) => {
+                        notify_req_region_removed(region_id, prop.id, prop.uuid, prop.cb);
+                    }
+                    Task::Apply(apply) => {
+                        if apply.entries.is_empty() {
+                            return false;
+                        }
+                        error!("[region {}] is missing", region_id);
+                    }
+                    Task::Destroy(_) => {}
+                    Task::ApplyRemoved(_) |
+                    Task::ApplyFinish(_) |
+                    Task::Shutdown => unreachable!(),
+                }
+                false
+            }
+            MapEntry::Occupied(e) => {
+                execute_task(sched, &self.pool, &self.db, handle, &self.notifier, e, task)
+            }
+        }
+    }
+
+    fn on_apply_finish(&mut self,
+                       region_id: u64,
+                       delegate: ApplyDelegate,
+                       handle: &Handle,
+                       sched: &mut Option<UnboundedSender<Task>>) {
+        let mut tasks = {
+            let queue = self.delegates.get_mut(&region_id).unwrap();
+            queue.delegate = Some(delegate);
+            if queue.pending_tasks.as_ref().map_or(true, |q| q.is_empty()) {
+                return;
+            }
+            queue.pending_tasks.take().unwrap()
+        };
+        while let Some(task) = tasks.pop_front() {
+            if self.handle_task(region_id, task, handle, sched) {
+                break;
+            }
+        }
+        self.delegates.get_mut(&region_id).unwrap().pending_tasks = Some(tasks);
+    }
+
+    fn on_apply_removed(&mut self,
+                        region_id: u64,
+                        peer_id: u64,
+                        handle: &Handle,
+                        sched: &mut Option<UnboundedSender<Task>>) {
+        let mut tasks = self.delegates.remove(&region_id).unwrap().pending_tasks.unwrap();
+        while let Some(task) = tasks.pop_front() {
+            match task {
+                Task::Propose(prop) => {
+                    notify_req_region_removed(region_id, peer_id, prop.uuid, prop.cb)
+                }
+                Task::Registration(reg) => {
+                    let delegate = ApplyDelegate::from_registration(self.db.clone(), reg);
+                    self.delegates.insert(region_id,
+                                          ApplyDelegateQueue {
+                                              delegate: None,
+                                              pending_tasks: Some(tasks),
+                                          });
+                    self.on_apply_finish(region_id, delegate, handle, sched);
+                    return;
+                }
+                Task::Apply(_) | Task::Destroy(_) => {}
+                Task::ApplyFinish(_) |
+                Task::ApplyRemoved(_) |
+                Task::Shutdown => unreachable!(),
+            }
+        }
+    }
+
+    pub fn start(mut self,
+                 sender: UnboundedSender<Task>,
+                 receiver: UnboundedReceiver<Task>)
+                 -> Result<JoinHandle<()>> {
+        let mut sched = Some(sender);
+        let res = Builder::new().name(thd_name!("apply scheduler")).spawn(move || {
+            let mut core = Core::new().unwrap();
+            let handle = core.handle();
+            {
+                let f = receiver.for_each(|task| {
+                    if let Task::Shutdown = task {
+                        // So receiver will be closed.
+                        sched.take();
+                        return Ok(());
+                    }
+                    let region_id = task.region_id();
+                    match task {
+                        Task::ApplyFinish(delegate) => {
+                            self.on_apply_finish(region_id, delegate, &handle, &mut sched)
+                        }
+                        Task::ApplyRemoved(removed) => {
+                            self.on_apply_removed(region_id, removed.peer_id, &handle, &mut sched)
+                        }
+                        t => {
+                            self.handle_task(region_id, t, &handle, &mut sched);
+                        }
+                    }
+                    Ok(())
+                });
+                core.run(f).unwrap();
+            }
+            self.handle_shutdown();
+            info!("apply sched stopped.");
+        });
+        let h = box_try!(res);
+        Ok(h)
     }
 }
 
-impl Runnable<Task> for Runner {
-    fn run(&mut self, task: Task) {
-        match task {
-            Task::Apply(a) => self.handle_apply(a),
-            Task::Propose(p) => self.handle_propose(p),
-            Task::Registration(s) => self.handle_registration(s),
-            Task::Destroy(d) => self.handle_destroy(d),
-        }
+fn execute_task<'a>(sender: &Option<UnboundedSender<Task>>,
+                    pool: &CpuPool,
+                    db: &Arc<DB>,
+                    handle: &Handle,
+                    notifier: &Sender<TaskRes>,
+                    mut e: OccupiedEntry<'a, u64, ApplyDelegateQueue>,
+                    task: Task)
+                    -> bool {
+    if e.get().delegate.is_none() {
+        e.get_mut().pending_tasks.as_mut().unwrap().push_back(task);
+        return false;
     }
+    match task {
+        Task::Registration(reg) => {
+            match e.get_mut().delegate {
+                Some(ref mut delegate) => {
+                    assert_eq!(reg.region.get_id(), delegate.region_id());
+                    delegate.term = reg.term;
+                    delegate.clear_all_commands_as_stale();
+                }
+                None => unreachable!(),
+            }
+            assert!(e.get().pending_tasks.as_ref().map_or(false, |p| p.is_empty()));
+            let delegate = ApplyDelegate::from_registration(db.clone(), reg);
+            e.insert(ApplyDelegateQueue::new(delegate));
+            false
+        }
+        Task::Apply(apply) => {
+            if apply.entries.is_empty() {
+                return false;
+            }
+            if sender.is_none() {
+                return false;
+            }
+            let region_id = apply.region_id;
+            let mut delegate = e.get_mut().delegate.take().unwrap();
+            let ch = sender.clone().unwrap();
+            let notifier = notifier.clone();
+            let f = pool.spawn_fn(move || {
+                delegate.metrics = ApplyMetrics::default();
+                delegate.term = apply.term;
+                let results = delegate.handle_raft_committed_entries(apply.entries);
 
-    fn shutdown(&mut self) {
-        self.handle_shutdown();
+                notifier.send(TaskRes::Apply(ApplyRes {
+                        region_id: apply.region_id,
+                        apply_state: delegate.apply_state.clone(),
+                        exec_res: results,
+                        metrics: delegate.metrics.clone(),
+                        applied_index_term: delegate.applied_index_term,
+                    }))
+                    .unwrap();
+
+                let t = if delegate.pending_remove {
+                    delegate.destroy();
+                    Task::ApplyRemoved(Removed {
+                        region_id: apply.region_id,
+                        peer_id: delegate.id,
+                    })
+                } else {
+                    Task::ApplyFinish(delegate)
+                };
+                ch.send(t).map_err(|e| {
+                    panic!("[region {}] can't send back apply result to apply worker: {:?}",
+                           region_id,
+                           e);
+                })
+            });
+            handle.spawn(f);
+            true
+        }
+        Task::Propose(prop) => {
+            let delegate = e.get_mut().delegate.as_mut().unwrap();
+            assert_eq!(prop.id, delegate.id);
+            let cmd = PendingCmd {
+                uuid: prop.uuid,
+                term: prop.term,
+                cb: Some(prop.cb),
+            };
+            if !prop.is_conf_change {
+                delegate.pending_cmds.append_normal(cmd);
+                return false;
+            }
+            if let Some(cmd) = delegate.pending_cmds.take_conf_change() {
+                notify_stale_command(&delegate.tag, delegate.term, cmd);
+            }
+            delegate.pending_cmds.set_conf_change(cmd);
+            false
+        }
+        Task::Destroy(des) => {
+            let queue = e.remove();
+            let mut delegate = queue.delegate.unwrap();
+            assert_eq!(delegate.region_id(), des.region_id);
+            delegate.destroy();
+            assert!(queue.pending_tasks.unwrap().is_empty());
+            notifier.send(TaskRes::Destroy(delegate)).unwrap();
+            false
+        }
+        Task::ApplyRemoved(_) |
+        Task::ApplyFinish(_) |
+        Task::Shutdown => unreachable!(),
     }
 }

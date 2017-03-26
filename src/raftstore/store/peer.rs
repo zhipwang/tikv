@@ -20,6 +20,7 @@ use std::vec::Vec;
 use std::default::Default;
 use std::time::{Instant, Duration};
 
+use futures::sync::mpsc::UnboundedSender;
 use time::Timespec;
 use rocksdb::{DB, WriteBatch};
 use protobuf::{self, Message, MessageStatic};
@@ -39,7 +40,7 @@ use raftstore::store::Config;
 use raftstore::store::worker::{apply, PdTask};
 use raftstore::store::worker::apply::ExecResult;
 
-use util::worker::{Worker, Scheduler};
+use util::worker::Worker;
 use raftstore::store::worker::{ApplyTask, ApplyRes};
 use util::{clocktime, Either, HashMap, HashSet};
 
@@ -209,7 +210,7 @@ pub struct Peer {
     // When entry exceed max size, reject to propose the entry.
     pub raft_entry_max_size: u64,
 
-    apply_scheduler: Scheduler<ApplyTask>,
+    apply_sched: Option<UnboundedSender<ApplyTask>>,
 
     marked_to_be_checked: bool,
 
@@ -310,7 +311,7 @@ impl Peer {
             coprocessor_host: CoprocessorHost::new(),
             size_diff_hint: 0,
             delete_keys_hint: 0,
-            apply_scheduler: store.apply_scheduler(),
+            apply_sched: store.apply_scheduler(),
             marked_to_be_checked: false,
             leader_missing_time: Some(Instant::now()),
             tag: tag,
@@ -699,7 +700,7 @@ impl Peer {
 
         if apply_snap_result.is_some() {
             let reg = ApplyTask::register(self);
-            self.apply_scheduler.schedule(reg).unwrap();
+            self.apply_sched.as_ref().unwrap().send(reg).unwrap();
         }
 
         apply_snap_result
@@ -737,7 +738,7 @@ impl Peer {
             if !committed_entries.is_empty() {
                 self.last_ready_idx = committed_entries.last().unwrap().get_index();
                 let apply_task = ApplyTask::apply(self.region_id, self.term(), committed_entries);
-                self.apply_scheduler.schedule(apply_task).unwrap();
+                self.apply_sched.as_ref().unwrap().send(apply_task).unwrap();
             }
         }
 
@@ -972,7 +973,7 @@ impl Peer {
                                    is_conf_change,
                                    meta.term,
                                    cb);
-        self.apply_scheduler.schedule(t).unwrap();
+        self.apply_sched.as_ref().unwrap().send(t).unwrap();
 
         self.proposals.push(meta);
     }
@@ -1327,6 +1328,7 @@ impl Peer {
 
     pub fn stop(&mut self) {
         self.mut_store().cancel_applying_snap();
+        self.apply_sched.take();
         for mut read in self.pending_reads.reads.drain(..) {
             read.cmds.clear();
         }

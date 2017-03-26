@@ -60,6 +60,9 @@ extern crate url;
 extern crate fs2;
 extern crate regex;
 extern crate fnv;
+extern crate futures;
+extern crate futures_cpupool;
+extern crate tokio_core;
 
 #[macro_use]
 pub mod util;

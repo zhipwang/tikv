@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::boxed::Box;
 use std::collections::Bound::{Excluded, Unbounded};
 use std::time::{Duration, Instant};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::u64;
 
 use rocksdb::DB;
@@ -38,6 +38,8 @@ use pd::PdClient;
 use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, StatusCmdType, StatusResponse,
                           RaftCmdRequest, RaftCmdResponse};
 use protobuf::Message;
+use futures::sync::mpsc::{self as future_mpsc, UnboundedSender, UnboundedReceiver};
+
 use raft::{self, SnapshotStatus, INVALID_INDEX};
 use raftstore::{Result, Error};
 use kvproto::metapb;
@@ -99,7 +101,9 @@ pub struct Store<T, C: 'static> {
     pd_worker: Worker<PdTask>,
     consistency_check_worker: Worker<ConsistencyCheckTask>,
 
-    pub apply_worker: Worker<ApplyTask>,
+    apply_thread: Option<JoinHandle<()>>,
+    pub apply_sched: Option<UnboundedSender<ApplyTask>>,
+    apply_receiver: Option<UnboundedReceiver<ApplyTask>>,
     apply_res_receiver: Option<StdReceiver<ApplyTaskRes>>,
 
     trans: T,
@@ -165,6 +169,8 @@ impl<T, C> Store<T, C> {
         let peer_cache = HashMap::default();
         let tag = format!("[store {}]", meta.get_id());
 
+        let (tx, rx) = future_mpsc::unbounded();
+
         let mut s = Store {
             cfg: Rc::new(cfg),
             store: meta,
@@ -180,7 +186,9 @@ impl<T, C> Store<T, C> {
             compact_worker: Worker::new("compact worker"),
             pd_worker: Worker::new("pd worker"),
             consistency_check_worker: Worker::new("consistency check worker"),
-            apply_worker: Worker::new("apply worker"),
+            apply_thread: None,
+            apply_sched: Some(tx),
+            apply_receiver: Some(rx),
             apply_res_receiver: None,
             region_ranges: BTreeMap::new(),
             pending_snapshot_regions: vec![],
@@ -298,8 +306,8 @@ impl<T, C> Store<T, C> {
         self.region_worker.scheduler()
     }
 
-    pub fn apply_scheduler(&self) -> Scheduler<ApplyTask> {
-        self.apply_worker.scheduler()
+    pub fn apply_scheduler(&self) -> Option<UnboundedSender<ApplyTask>> {
+        self.apply_sched.clone()
     }
 
     pub fn engine(&self) -> Arc<DB> {
@@ -411,7 +419,9 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let (tx, rx) = mpsc::channel();
         let apply_runner = ApplyRunner::new(self, tx);
         self.apply_res_receiver = Some(rx);
-        box_try!(self.apply_worker.start(apply_runner));
+        let handle = box_try!(apply_runner.start(self.apply_sched.clone().unwrap(),
+                                                 self.apply_receiver.take().unwrap()));
+        self.apply_thread = Some(handle);
 
         try!(event_loop.run(self));
         Ok(())
@@ -433,7 +443,10 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         handles.push(self.compact_worker.stop());
         handles.push(self.pd_worker.stop());
         handles.push(self.consistency_check_worker.stop());
-        handles.push(self.apply_worker.stop());
+
+        self.apply_sched.as_ref().unwrap().send(ApplyTask::shutdown()).unwrap();
+        self.apply_sched.take();
+        handles.push(self.apply_thread.take());
 
         for h in handles {
             if let Some(h) = h {
@@ -566,7 +579,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 info!("[region {}] asking destroying stale peer {:?}",
                       region_id,
                       p);
-                self.apply_worker.schedule(ApplyTask::destroy(region_id)).unwrap();
+                self.apply_sched.as_ref().unwrap().send(ApplyTask::destroy(region_id)).unwrap();
                 return Ok(false);
             }
             info!("[region {}] destroying stale peer {:?}", region_id, p);
@@ -799,7 +812,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
         if need_remove {
             if async_remove {
-                self.apply_worker.schedule(ApplyTask::destroy(region_id)).unwrap();
+                self.apply_sched.as_ref().unwrap().send(ApplyTask::destroy(region_id)).unwrap();
             } else {
                 self.destroy_peer(region_id, msg.get_to_peer().clone());
             }
@@ -1086,7 +1099,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                     panic!("region should exist, {:?}", right);
                 }
                 new_peer.size_diff_hint = self.cfg.region_check_size_diff;
-                self.apply_worker.schedule(ApplyTask::register(&new_peer)).unwrap();
+                self.apply_sched.as_ref().unwrap().send(ApplyTask::register(&new_peer)).unwrap();
                 self.region_peers.insert(new_region_id, new_peer);
             }
         }
@@ -1500,7 +1513,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             peer.check_peers();
         }
 
-        let mut leader_count = 0;
+        let mut leader_count: usize = 0;
         for peer in self.region_peers.values() {
             if peer.is_leader() {
                 leader_count += 1;
