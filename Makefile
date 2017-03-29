@@ -53,7 +53,7 @@ test:
 	# again here. LOCAL_DIR is defined in .travis.yml.
 	export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH}:${LOCAL_DIR}/lib" && \
 	export LOG_LEVEL=DEBUG && \
-	export RUST_BACKTRACE=1 && \
+	export RUST_BACKTRACE=full && \
 	cargo test --features "${ENABLE_FEATURES}" ${NO_RUN} -- --nocapture && \
 	cargo test --features "${ENABLE_FEATURES}" --bench benches ${NO_RUN} -- --nocapture 
 	# TODO: remove above target once https://github.com/rust-lang/cargo/issues/2984 is resolved.
