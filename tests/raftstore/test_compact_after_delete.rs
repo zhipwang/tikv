@@ -48,6 +48,7 @@ fn test_compact_after_delete<T: Simulator>(cluster: &mut Cluster<T>) {
             engine.get_approximate_sizes_cf(cf_handle, &[Range::new(b"", b"k9")])[0];
         assert_eq!(approximate_size, 0);
     }
+panic!("");
 }
 
 #[test]
