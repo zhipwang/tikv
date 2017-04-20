@@ -66,6 +66,7 @@ extern crate fnv;
 extern crate futures;
 extern crate futures_cpupool;
 extern crate tokio_core;
+extern crate tokio_timer;
 
 #[macro_use]
 pub mod util;
