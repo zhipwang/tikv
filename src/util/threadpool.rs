@@ -15,7 +15,7 @@ use std::usize;
 use std::sync::{Arc, Mutex, Condvar};
 use std::thread::{Builder, JoinHandle};
 use std::boxed::FnBox;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::hash::Hash;
@@ -70,9 +70,117 @@ pub trait ScheduleQueue<T> {
     fn on_task_started(&mut self, group_id: &T);
 }
 
+pub struct ThrottledAllBigGroupsQueue<T> {
+    waiting1_queue: VecDeque<Task<T>>,
+    waiting2_queue: VecDeque<Task<T>>,
+    running_groups: HashMap<T, usize>,
+    waiting1_groups: HashSet<T>,
+    waiting2_groups: HashMap<T, usize>,
+    big_group_currency_on_busy: usize,
+}
+
+
+impl<T: Hash + Eq + Ord + Send + Clone> ThrottledAllBigGroupsQueue<T> {
+    pub fn new(group_concurrency_on_busy: usize) -> ThrottledAllBigGroupsQueue<T> {
+        ThrottledAllBigGroupsQueue {
+            waiting1_queue: VecDeque::new(),
+            waiting2_queue: VecDeque::new(),
+            waiting1_groups: HashSet::new(),
+            waiting2_groups: HashMap::new(),
+            running_groups: HashMap::new(),
+            big_group_currency_on_busy: group_concurrency_on_busy,
+        }
+    }
+
+    fn try_push_into_waiting1_queue(&mut self, task: Task<T>) -> Result<(), PushError<Task<T>>> {
+        if self.waiting2_groups.contains_key(&task.group_id) ||
+           self.waiting1_groups.contains(&task.group_id) ||
+           self.running_groups.contains_key(&task.group_id) {
+            return Err(PushError(task));
+        }
+        self.waiting1_groups.insert(task.group_id.clone());
+        self.waiting1_queue.push_back(task);
+        Ok(())
+    }
+
+    fn pop_from_waiting1_queue(&mut self) -> Option<Task<T>> {
+        if self.waiting1_groups.is_empty() {
+            return None;
+        }
+        let task = self.waiting1_queue.pop_front().unwrap();
+        self.waiting1_groups.remove(&task.group_id);
+        Some(task)
+    }
+
+    fn pop_from_waiting2_queue(&mut self) -> Option<Task<T>> {
+        if self.waiting2_queue.is_empty() {
+            return None;
+        }
+        let task = self.waiting2_queue.pop_front().unwrap();
+        let is_empty = {
+            let mut count = self.waiting2_groups.get_mut(&task.group_id).unwrap();
+            *count -= 1;
+            *count == 0
+        };
+        if is_empty {
+            self.waiting2_groups.remove(&task.group_id);
+        }
+        Some(task)
+    }
+}
+
+impl<T: Hash + Eq + Ord + Send + Clone> ScheduleQueue<T> for ThrottledAllBigGroupsQueue<T> {
+    fn push(&mut self, task: Task<T>) {
+        if let Err(PushError(task)) = self.try_push_into_waiting1_queue(task) {
+            let count = self.waiting2_groups.entry(task.group_id.clone()).or_insert(0);
+            *count += 1;
+            self.waiting2_queue.push_back(task);
+        }
+    }
+
+    fn pop(&mut self) -> Option<Task<T>> {
+        if self.waiting2_queue.is_empty() {
+            return self.pop_from_waiting1_queue();
+        }
+
+        if self.waiting1_queue.is_empty() {
+            return self.pop_from_waiting2_queue();
+        }
+
+        let pop_from_waiting1 = {
+            let t1 = self.waiting1_queue.front().unwrap();
+            let t2 = self.waiting2_queue.front().unwrap();
+            t1.id < t2.id ||
+            (self.running_groups.contains_key(&t2.group_id) &&
+             self.running_groups[&t2.group_id] >= self.big_group_currency_on_busy)
+        };
+
+        if !pop_from_waiting1 {
+            return self.pop_from_waiting2_queue();
+        }
+        self.pop_from_waiting1_queue()
+    }
+
+    fn on_task_started(&mut self, group_id: &T) {
+        let count = self.running_groups.entry(group_id.clone()).or_insert(0);
+        *count += 1;
+    }
+
+    fn on_task_finished(&mut self, group_id: &T) {
+        let count = {
+            let mut count = self.running_groups.get_mut(group_id).unwrap();
+            *count -= 1;
+            *count
+        };
+        if count == 0 {
+            self.running_groups.remove(group_id);
+        }
+    }
+}
+
 pub struct PushError<T>(pub T);
 
-// `BigGroupThrottledQueue` tries to throttle group's concurrency to
+// `BigGroupThrottledQueue` tries to throttle each group's concurrency to
 //  `group_concurrency_on_busy` when it's busy.
 // When one worker asks a task to run, it schedules in the following way:
 // 1. Find out which group has a running number that is smaller than
@@ -392,7 +500,8 @@ impl<Q, T> Worker<Q, T>
 
 #[cfg(test)]
 mod test {
-    use super::{ThreadPool, BigGroupThrottledQueue, Task, ScheduleQueue};
+    use super::{ThreadPool, BigGroupThrottledQueue, ThrottledAllBigGroupsQueue, Task,
+                ScheduleQueue};
     use std::thread::sleep;
     use std::time::Duration;
     use std::sync::mpsc::channel;
@@ -597,5 +706,55 @@ mod test {
         let task = queue.pop().unwrap();
         assert_eq!(task.group_id, group2);
         queue.on_task_started(&group2);
+    }
+
+    #[test]
+    fn test_queue_throttled_all_big_groups_on_busy() {
+        let max_threads_for_big_group = 1;
+        let mut queue = ThrottledAllBigGroupsQueue::new(max_threads_for_big_group);
+        // Push 4 tasks of `group1` into queue
+        let group1 = 1001;
+        let mut id = 0;
+        for _ in 0..4 {
+            let task = Task::new(id, group1, move || {});
+            id += 1;
+            queue.push(task);
+        }
+
+        // Push 4 tasks of `group2` into queue.
+        let group2 = 1002;
+        for _ in 0..4 {
+            let task = Task::new(id, group2, move || {});
+            id += 1;
+            queue.push(task);
+        }
+
+        // queue: g1, g1, g1, g1, g2, g2, g2, g2.
+        let task = queue.pop().unwrap();
+        assert_eq!(task.group_id, group1);
+        queue.on_task_started(&group1);
+
+        // queue: g1, g1, g1, g2, g2, g2, g2. running: g1
+        let task = queue.pop().unwrap();
+        assert_eq!(task.group_id, group2);
+        queue.on_task_started(&group2);
+        // queue: g1, g1, g1, g2, g2, g2, g2. running: g1, g2
+        queue.on_task_finished(&group1);
+        queue.on_task_finished(&group2);
+
+        // queue: g1, g1, g1, g2, g2, g2, g2. running: empty
+        for _ in 0..3 {
+            let task = queue.pop().unwrap();
+            assert_eq!(task.group_id, group1);
+            queue.on_task_started(&group1);
+        }
+
+        for _ in 0..3 {
+            let task = queue.pop().unwrap();
+            assert_eq!(task.group_id, group2);
+            queue.on_task_started(&group2);
+        }
+
+
     }
 }
