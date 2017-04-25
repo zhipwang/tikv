@@ -322,7 +322,24 @@ impl ApplyDelegate {
         let uuid = util::get_uuid_from_req(&cmd).unwrap();
         let cmd_cb = self.find_cb(uuid, term, &cmd);
         let timer = PEER_APPLY_LOG_HISTOGRAM.start_timer();
-        let (mut resp, exec_result) = self.apply_raft_cmd(index, term, &cmd);
+
+        if let Some(cb) = cmd_cb {
+            let requests = cmd.get_requests();
+            let mut responses = Vec::with_capacity(requests.len());
+
+            for req in requests {
+                let mut resp = Response::new();
+                resp.set_cmd_type(req.get_cmd_type());
+                responses.push(resp);
+            }
+
+            let mut resp = RaftCmdResponse::new();
+            resp.set_responses(RepeatedField::from_vec(responses));
+
+            cb(resp);
+        }
+
+        let (_, exec_result) = self.apply_raft_cmd(index, term, &cmd);
         timer.observe_duration();
 
         debug!("{} applied command with uuid {:?} at log index {}",
@@ -330,18 +347,18 @@ impl ApplyDelegate {
                uuid,
                index);
 
-        let cb = match cmd_cb {
-            None => return exec_result,
-            Some(cb) => cb,
-        };
-
-        // TODO: Involve post apply hook.
-        // TODO: if we have exec_result, maybe we should return this callback too. Outer
-        // store will call it after handing exec result.
-        // Bind uuid here.
-        cmd_resp::bind_uuid(&mut resp, uuid);
-        cmd_resp::bind_term(&mut resp, self.term);
-        cb.call_box((resp,));
+        //        let cb = match cmd_cb {
+        //            None => return exec_result,
+        //            Some(cb) => cb,
+        //        };
+        //
+        //        // TODO: Involve post apply hook.
+        //        // TODO: if we have exec_result, maybe we should return this callback too. Outer
+        //        // store will call it after handing exec result.
+        //        // Bind uuid here.
+        //        cmd_resp::bind_uuid(&mut resp, uuid);
+        //        cmd_resp::bind_term(&mut resp, self.term);
+        //        cb.call_box((resp,));
 
         exec_result
     }
@@ -485,7 +502,7 @@ impl ApplyDelegate {
     fn exec_raft_cmd(&mut self,
                      ctx: &mut ExecContext)
                      -> Result<(RaftCmdResponse, Option<ExecResult>)> {
-        try!(check_epoch(&self.region, ctx.req));
+        // try!(check_epoch(&self.region, ctx.req));
         if ctx.req.has_admin_request() {
             self.exec_admin_cmd(ctx)
         } else {
