@@ -358,6 +358,13 @@ fn get_rocksdb_db_option(config: &toml::Value) -> RocksdbOptions {
         opts.set_ratelimiter(rate_bytes_per_sec as i64);
     }
 
+    let direct_io_reads = get_toml_boolean(config, "rocksdb.use-direct-io-reads".as_str(),
+                                       Some(false));
+    opts.set_use_direct_reads(direct_io_reads);
+    let direct_io_writes = get_toml_boolean(config, "rocksdb.use-direct-io-writes".as_str(),
+                                           Some(false));
+    opts.set_use_direct_writes(direct_io_writes);
+
     opts
 }
 
