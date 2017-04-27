@@ -447,6 +447,18 @@ fn get_rocksdb_cf_option(config: &toml::Value,
                      Some(36));
     opts.set_level_zero_stop_writes_trigger(level_zero_stop_writes_trigger as i32);
 
+    let soft_pending_compaction_bytes_limit =
+        get_toml_int(config,
+                     (prefix.clone() + "soft-pending-compaction-bytes-limit").as_str(),
+                     Some(64 * 1024 * 1024 * 1024));
+    opts.set_soft_pending_compaction_bytes_limit(soft_pending_compaction_bytes_limit as u64);
+
+    let hard_pending_compaction_bytes_limit =
+        get_toml_int(config,
+                     (prefix.clone() + "hard-pending-compaction-bytes-limit").as_str(),
+                     Some(256 * 1024 * 1024 * 1024));
+    opts.set_hard_pending_compaction_bytes_limit(hard_pending_compaction_bytes_limit as u64);
+
     opts
 }
 
