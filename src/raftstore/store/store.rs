@@ -82,6 +82,7 @@ pub struct StoreStat {
     pub region_keys_written: LocalHistogram,
     pub lock_cf_bytes_written: u64,
     pub engine_total_bytes_written: u64,
+    pub engine_total_stall_micros: u64,
 }
 
 impl Default for StoreStat {
@@ -91,6 +92,7 @@ impl Default for StoreStat {
             region_keys_written: REGION_WRITTEN_KEYS_HISTOGRAM.local(),
             lock_cf_bytes_written: 0,
             engine_total_bytes_written: 0,
+            engine_total_stall_micros: 0,
         }
     }
 }
@@ -1647,6 +1649,17 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let delta = engine_total_bytes_written - self.store_stat.engine_total_bytes_written;
         self.store_stat.engine_total_bytes_written = engine_total_bytes_written;
         stats.set_bytes_written(delta);
+
+        // report stall
+        let engine_total_stall_micros = self.engine
+            .get_statistics_ticker_count(TickerType::StallMicros);
+        let delta = if engine_total_stall_micros > self.store_stat.engine_total_stall_micros {
+            engine_total_stall_micros - self.store_stat.engine_total_stall_micros
+        } else {
+            0
+        };
+        self.store_stat.engine_total_stall_micros = engine_total_stall_micros;
+        stats.set_stall_micros(delta);
 
         stats.set_is_busy(self.is_busy);
         self.is_busy = false;
