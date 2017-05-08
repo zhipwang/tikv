@@ -35,7 +35,7 @@ use util::xeval::{Evaluator, EvalContext};
 use util::{escape, duration_to_ms, duration_to_sec, Either};
 use util::worker::{BatchRunnable, Scheduler};
 use util::collections::{HashMap, HashMapEntry as Entry, HashSet};
-use util::threadpool::{ThreadPool, BigGroupThrottledQueue};
+use util::threadpool::{ThreadPool, SpeedupSmallGroups};
 use server::OnResponse;
 
 use super::{Error, Result};
@@ -70,7 +70,7 @@ pub struct Host {
     sched: Scheduler<Task>,
     reqs: HashMap<u64, Vec<RequestTask>>,
     last_req_id: u64,
-    pool: ThreadPool<BigGroupThrottledQueue<u64>, u64>,
+    pool: ThreadPool<SpeedupSmallGroups<u64>, u64>,
     max_running_task_count: usize,
 }
 
@@ -80,8 +80,7 @@ impl Host {
                concurrency: usize,
                txn_concurrency_on_busy: usize)
                -> Host {
-        let queue: BigGroupThrottledQueue<u64> =
-            BigGroupThrottledQueue::new(txn_concurrency_on_busy);
+        let queue: SpeedupSmallGroups<u64> = SpeedupSmallGroups::new(txn_concurrency_on_busy);
         Host {
             engine: engine,
             sched: scheduler,

@@ -85,6 +85,7 @@ pub struct ReachConcurrencyLimit<T: Debug>(pub T);
 struct GroupStatisticsItem {
     running_count: usize,
     high_priority_queue_count: usize,
+    low_priority_queue_count: usize,
 }
 
 impl GroupStatisticsItem {
@@ -92,11 +93,107 @@ impl GroupStatisticsItem {
         GroupStatisticsItem {
             running_count: 0,
             high_priority_queue_count: 0,
+            low_priority_queue_count: 0,
         }
     }
 
     fn sum(&self) -> usize {
-        self.running_count + self.high_priority_queue_count
+        self.running_count + self.high_priority_queue_count + self.low_priority_queue_count
+    }
+}
+
+
+pub struct SpeedupSmallGroups<T> {
+    high_priority_queue: VecDeque<Task<T>>,
+    low_priority_queue: VecDeque<Task<T>>,
+    big_group_currency_on_busy: usize,
+    statistics: HashMap<T, GroupStatisticsItem>,
+}
+
+
+impl<T: Hash + Eq + Ord + Send + Clone + Debug> SpeedupSmallGroups<T> {
+    pub fn new(group_concurrency_on_busy: usize) -> SpeedupSmallGroups<T> {
+        SpeedupSmallGroups {
+            high_priority_queue: VecDeque::new(),
+            low_priority_queue: VecDeque::new(),
+            statistics: HashMap::new(),
+            big_group_currency_on_busy: group_concurrency_on_busy,
+        }
+    }
+
+    fn pop_from_high_priority_queue(&mut self) -> Option<Task<T>> {
+        if self.high_priority_queue.is_empty() {
+            return None;
+        }
+        let task = self.high_priority_queue.pop_front().unwrap();
+        let mut statistics = self.statistics.get_mut(&task.gid).unwrap();
+        statistics.high_priority_queue_count -= 1;
+        Some(task)
+    }
+
+    fn pop_from_low_priority_queue(&mut self) -> Option<Task<T>> {
+        if self.low_priority_queue.is_empty() {
+            return None;
+        }
+        let task = self.low_priority_queue.pop_front().unwrap();
+        let mut statistics = self.statistics
+            .get_mut(&task.gid)
+            .unwrap();
+        statistics.low_priority_queue_count -= 1;
+        Some(task)
+    }
+}
+
+impl<T: Hash + Eq + Ord + Send + Clone + Debug> ScheduleQueue<T> for SpeedupSmallGroups<T> {
+    fn push(&mut self, task: Task<T>) {
+        let mut statistics = self.statistics
+            .entry(task.gid.clone())
+            .or_insert(GroupStatisticsItem::new());
+        if statistics.sum() == 0 {
+            self.high_priority_queue.push_back(task);
+            statistics.high_priority_queue_count += 1;
+        } else {
+            self.low_priority_queue.push_back(task);
+            statistics.low_priority_queue_count += 1;
+        }
+    }
+
+    fn pop(&mut self) -> Option<Task<T>> {
+        if self.low_priority_queue.is_empty() {
+            return self.pop_from_high_priority_queue();
+        }
+
+        if self.high_priority_queue.is_empty() {
+            return self.pop_from_low_priority_queue();
+        }
+
+        let pop_from_waiting1 = {
+            let t1 = self.high_priority_queue.front().unwrap();
+            let t2 = self.low_priority_queue.front().unwrap();
+            t1.id < t2.id ||
+            (self.statistics[&t2.gid].running_count >= self.big_group_currency_on_busy)
+        };
+
+        if !pop_from_waiting1 {
+            return self.pop_from_low_priority_queue();
+        }
+        self.pop_from_high_priority_queue()
+    }
+
+    fn on_task_started(&mut self, gid: &T) {
+        let mut statistics = self.statistics.get_mut(gid).unwrap();
+        statistics.running_count += 1;
+    }
+
+    fn on_task_finished(&mut self, gid: &T) {
+        let count = {
+            let mut statistics = self.statistics.get_mut(gid).unwrap();
+            statistics.running_count -= 1;
+            statistics.sum()
+        };
+        if count == 0 {
+            self.statistics.remove(gid);
+        }
     }
 }
 
