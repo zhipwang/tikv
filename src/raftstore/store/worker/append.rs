@@ -16,6 +16,7 @@ use std::sync::mpsc::Sender;
 use std::fmt::{self, Display, Formatter};
 
 use rocksdb::{DB, WriteBatch};
+use rocksdb::rocksdb_options::WriteOptions;
 use util::worker::Runnable;
 use raft::Ready;
 use raftstore::store::peer_storage::InvokeContext;
@@ -39,14 +40,16 @@ pub struct Runner {
     tag: String,
     db: Arc<DB>,
     notifier: Sender<TaskRes>,
+    sync_log: bool,
 }
 
 impl Runner {
-    pub fn new(tag: String, db: Arc<DB>, notifier: Sender<TaskRes>) -> Runner {
+    pub fn new(tag: String, db: Arc<DB>, notifier: Sender<TaskRes>, sync_log: bool) -> Runner {
         Runner {
             tag: tag,
             db: db,
             notifier: notifier,
+            sync_log: sync_log,
         }
     }
 
@@ -55,7 +58,9 @@ impl Runner {
             panic!("{} write batch should not empty", self.tag);
         }
 
-        self.db.write(task.wb).unwrap_or_else(|e| {
+        let mut write_opts = WriteOptions::new();
+        write_opts.set_sync(self.sync_log);
+        self.db.write_opt(task.wb, &write_opts).unwrap_or_else(|e| {
             panic!("{} failed to save append result: {:?}", self.tag, e);
         });
 
