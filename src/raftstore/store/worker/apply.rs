@@ -30,7 +30,7 @@ use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, ChangePeerRequest, Cm
 use util::worker::Runnable;
 use util::{SlowTimer, rocksdb, escape};
 use util::collections::{HashMap, HashMapEntry as MapEntry};
-use storage::{CF_LOCK, CF_RAFT};
+use storage::{CF_LOCK, CF_RAFT, ALL_CFS};
 use raftstore::{Result, Error};
 use raftstore::coprocessor::CoprocessorHost;
 use raftstore::store::{Store, cmd_resp, keys, util};
@@ -368,7 +368,7 @@ impl ApplyDelegate {
 
                 // flush to engine
                 self.engine
-                    .write(apply_ctx.wb.take().unwrap())
+                    .write_without_wal(apply_ctx.wb.take().unwrap())
                     .unwrap_or_else(|e| {
                         panic!("{} failed to write to engine, error: {:?}", self.tag, e)
                     });
@@ -1258,7 +1258,7 @@ impl Runner {
 
         // Write to engine
         self.db
-            .write(apply_ctx.wb.take().unwrap())
+            .write_without_wal(apply_ctx.wb.take().unwrap())
             .unwrap_or_else(|e| panic!("failed to write to engine, error: {:?}", e));
 
         // Call callbacks
@@ -1320,7 +1320,19 @@ impl Runner {
         }
     }
 
+    fn flush_engine(&mut self) {
+        for cf in ALL_CFS {
+            let cf_handle = rocksdb::get_cf_handle(&self.db, cf).unwrap();
+            self.db.flush_cf(cf_handle, true).unwrap();
+        }
+    }
+
     fn handle_shutdown(&mut self) {
+        // 1) Because we write rocksdb without WAL, so we need flush all memtable
+        // into SST before shutdown;
+        // 2) Don't need recovery from WAL when start again, this will speedup startup.
+        self.flush_engine();
+
         for p in self.delegates.values_mut() {
             p.clear_pending_commands();
         }
