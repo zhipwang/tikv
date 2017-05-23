@@ -20,6 +20,7 @@ use time::{self, Timespec};
 use std::collections::hash_map::Entry;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::vec_deque::{Iter, VecDeque};
+use std::hash::Hash;
 
 use prometheus;
 use rand::{self, ThreadRng};
@@ -48,7 +49,7 @@ pub mod collections;
 #[cfg(target_os="linux")]
 mod thread_metrics;
 
-use self::collections::HashMap;
+use self::collections::{HashMap, HashSet};
 
 pub const NO_LIMIT: u64 = u64::MAX;
 
@@ -496,6 +497,10 @@ pub fn cfs_diff<'a>(a: &[&'a str], b: &[&str]) -> Vec<&'a str> {
 
 pub fn calc_map_mem<K, V, S>(m: &HashMap<K, V, S>) -> usize {
     m.capacity() * (mem::size_of::<K>() + mem::size_of::<V>() + 8)
+}
+
+pub fn calc_set_mem<K: Eq + Hash>(s: &HashSet<K>) -> usize {
+    s.capacity() * (mem::size_of::<K>() + 8)
 }
 
 #[cfg(test)]

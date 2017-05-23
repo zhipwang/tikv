@@ -43,7 +43,7 @@ use raftstore::{Result, Error};
 use kvproto::metapb;
 use util::worker::{Worker, Scheduler, FutureWorker};
 use util::transport::SendCh;
-use util::{cal_map_mem, rocksdb, RingQueue};
+use util::{calc_map_mem, calc_set_mem, rocksdb, RingQueue};
 use util::collections::{HashMap, HashSet};
 use storage::{CF_DEFAULT, CF_LOCK, CF_WRITE};
 use raftstore::coprocessor::CoprocessorHost;
@@ -1694,11 +1694,10 @@ impl<T: Transport, C: PdClient> Store<T, C> {
     fn report_memory_usage(&self) {
         let mut store_mem = calc_map_mem(&self.region_peers);
         store_mem += calc_set_mem(&self.pending_raft_groups);
-        store_mem += 
-        store_mem += self.pending_raft_groups.capacity() * mem::size_of::<u64>();
         for (key, _) in &self.region_ranges {
             store_mem += key.capacity() + 8;
         }
+        store_mem += self.region_ranges.len() * mem::size_of::<Key>();
         
         let (mut peer_mem, mut raft_mem) = (0, 0);
         for (_, p) in &self.region_peers {
@@ -1709,6 +1708,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         STORE_MEM_USAGE.with_label_values(&["store"]).set(store_mem as f64);
         STORE_MEM_USAGE.with_label_values(&["peer"]).set(peer_mem as f64);
         STORE_MEM_USAGE.with_label_values(&["raft"]).set(raft_mem as f64);
+        self.apply_worker.schedule(ApplyTask::CalcMemory).unwrap();
     }
 
     fn flush_engine_statistics(&mut self) {
