@@ -43,7 +43,7 @@ use raftstore::{Result, Error};
 use kvproto::metapb;
 use util::worker::{Worker, Scheduler, FutureWorker};
 use util::transport::SendCh;
-use util::{rocksdb, RingQueue};
+use util::{cal_map_mem, rocksdb, RingQueue};
 use util::collections::{HashMap, HashSet};
 use storage::{CF_DEFAULT, CF_LOCK, CF_WRITE};
 use raftstore::coprocessor::CoprocessorHost;
@@ -1692,7 +1692,9 @@ impl<T: Transport, C: PdClient> Store<T, C> {
     }
 
     fn report_memory_usage(&self) {
-        let mut store_mem = self.region_peers.capacity() * mem::size_of::<Peer>();
+        let mut store_mem = calc_map_mem(&self.region_peers);
+        store_mem += calc_set_mem(&self.pending_raft_groups);
+        store_mem += 
         store_mem += self.pending_raft_groups.capacity() * mem::size_of::<u64>();
         for (key, _) in &self.region_ranges {
             store_mem += key.capacity() + 8;

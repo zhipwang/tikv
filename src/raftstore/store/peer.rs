@@ -40,7 +40,7 @@ use raftstore::store::worker::apply::ExecResult;
 
 use util::worker::{FutureWorker as Worker, Scheduler};
 use raftstore::store::worker::{ApplyTask, ApplyRes, Apply};
-use util::{clocktime, Either, strftimespec};
+use util::{calc_map_mem, clocktime, Either, strftimespec};
 use util::collections::{HashMap, HashSet, HashMapValues as Values};
 
 use pd::INVALID_ID;
@@ -363,7 +363,7 @@ impl Peer {
         self.proposals.queue.capacity() * mem::size_of::<ProposalMeta>()
         + self.proposals.uuids.capacity() * mem::size_of::<Uuid>()
         + self.pending_reads.reads.capacity() * mem::size_of::<ReadIndexRequest>()
-        + self.peer_heartbeats.capacity() * (8 + mem::size_of::<Instant>())
+        + calc_map_mem(&self.peer_heartbeats)
     }
 
     pub fn calc_raft_memory_usage(&self) -> usize {

@@ -13,15 +13,13 @@
 
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::io;
-use std::{slice, thread};
+use std::{slice, thread, mem, u64, io};
 use std::net::{ToSocketAddrs, TcpStream, SocketAddr};
 use std::time::{Duration, Instant};
 use time::{self, Timespec};
 use std::collections::hash_map::Entry;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::vec_deque::{Iter, VecDeque};
-use std::u64;
 
 use prometheus;
 use rand::{self, ThreadRng};
@@ -49,6 +47,8 @@ pub mod collections;
 
 #[cfg(target_os="linux")]
 mod thread_metrics;
+
+use self::collections::HashMap;
 
 pub const NO_LIMIT: u64 = u64::MAX;
 
@@ -492,6 +492,10 @@ impl<T> RingQueue<T> {
 // `cfs_diff' Returns a Vec of cf which is in `a' but not in `b'.
 pub fn cfs_diff<'a>(a: &[&'a str], b: &[&str]) -> Vec<&'a str> {
     a.iter().filter(|x| b.iter().find(|y| y == x).is_none()).map(|x| *x).collect()
+}
+
+pub fn calc_map_mem<K, V, S>(m: &HashMap<K, V, S>) -> usize {
+    m.capacity() * (mem::size_of::<K>() + mem::size_of::<V>() + 8)
 }
 
 #[cfg(test)]

@@ -38,6 +38,7 @@ use raft::progress::{Progress, Inflights, ProgressState};
 use raft::errors::{Result, Error, StorageError};
 use raft::raft_log::{self, RaftLog};
 use raft::read_only::{ReadOnlyOption, ReadState, ReadOnly};
+use util;
 
 use super::HashMap;
 
@@ -779,10 +780,12 @@ impl<T: Storage> Raft<T> {
 
     pub fn calc_memory_usage(&self) -> usize {
         self.read_states.capacity() * mem::size_of::<ReadState>()
-        + self.prs.capacity() * (8 + mem::size_of::<Progress>())
+        + util::calc_map_mem(&self.prs)
         + self.prs.len() * self.max_inflight * 8
         + self.raft_log.unstable.entries.capacity() * mem::size_of::<Entry>()
         + self.msgs.capacity() * mem::size_of::<Message>()
+        + util::calc_map_mem(&self.read_only.pending_read_index)
+        + self.read_only.read_index_queue.capacity() * mem::size_of::<Vec<u8>>()
     }
 
     fn poll(&mut self, id: u64, t: MessageType, v: bool) -> usize {
