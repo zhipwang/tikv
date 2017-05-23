@@ -180,4 +180,11 @@ lazy_static! {
             "Size of snapshot",
              exponential_buckets(1024.0, 2.0, 22).unwrap() // 1024,1024*2^1,..,4G
         ).unwrap();
+    
+    pub static ref STORE_MEM_USAGE: GaugeVec =
+        register_gauge_vec!(
+            "tikv_raftstore_memory_usage",
+            "Memory usage of raftstore",
+            &["type"]
+        ).unwrap();
 }

@@ -26,7 +26,7 @@
 // limitations under the License.
 
 
-use std::cmp;
+use std::{cmp, mem};
 use std::boxed::Box;
 
 use rand::{self, Rng};
@@ -775,6 +775,14 @@ impl<T: Storage> Raft<T> {
             }
             self.send(m);
         }
+    }
+
+    pub fn calc_memory_usage(&self) -> usize {
+        self.read_states.capacity() * mem::size_of::<ReadState>()
+        + self.prs.capacity() * (8 + mem::size_of::<Progress>())
+        + self.prs.len() * self.max_inflight * 8
+        + self.raft_log.unstable.entries.capacity() * mem::size_of::<Entry>()
+        + self.msgs.capacity() * mem::size_of::<Message>()
     }
 
     fn poll(&mut self, id: u64, t: MessageType, v: bool) -> usize {

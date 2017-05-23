@@ -19,8 +19,7 @@ use std::collections::BTreeMap;
 use std::boxed::Box;
 use std::collections::Bound::{Included, Excluded, Unbounded};
 use std::time::{Duration, Instant};
-use std::thread;
-use std::u64;
+use std::{thread, u64, mem};
 
 use rocksdb::{DB, DBStatisticsTickerType as TickerType};
 use rocksdb::rocksdb_options::WriteOptions;
@@ -1687,8 +1686,27 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
     fn on_pd_store_heartbeat_tick(&mut self, event_loop: &mut EventLoop<Self>) {
         self.store_heartbeat_pd();
+        self.report_memory_usage();
         self.flush_engine_statistics();
         self.register_pd_store_heartbeat_tick(event_loop);
+    }
+
+    fn report_memory_usage(&self) {
+        let mut store_mem = self.region_peers.capacity() * mem::size_of::<Peer>();
+        store_mem += self.pending_raft_groups.capacity() * mem::size_of::<u64>();
+        for (key, _) in &self.region_ranges {
+            store_mem += key.capacity() + 8;
+        }
+        
+        let (mut peer_mem, mut raft_mem) = (0, 0);
+        for (_, p) in &self.region_peers {
+            peer_mem += p.calc_memory_usage();
+            raft_mem += p.calc_raft_memory_usage();
+        }
+
+        STORE_MEM_USAGE.with_label_values(&["store"]).set(store_mem as f64);
+        STORE_MEM_USAGE.with_label_values(&["peer"]).set(peer_mem as f64);
+        STORE_MEM_USAGE.with_label_values(&["raft"]).set(raft_mem as f64);
     }
 
     fn flush_engine_statistics(&mut self) {

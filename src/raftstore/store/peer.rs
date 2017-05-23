@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 use std::vec::Vec;
 use std::default::Default;
 use std::time::{Instant, Duration};
+use std::mem;
 
 use time::Timespec;
 use rocksdb::{DB, WriteBatch};
@@ -356,6 +357,17 @@ impl Peer {
             self.marked_to_be_checked = true;
             pending_raft_groups.insert(self.region_id);
         }
+    }
+
+    pub fn calc_memory_usage(&self) -> usize {
+        self.proposals.queue.capacity() * mem::size_of::<ProposalMeta>()
+        + self.proposals.uuids.capacity() * mem::size_of::<Uuid>()
+        + self.pending_reads.reads.capacity() * mem::size_of::<ReadIndexRequest>()
+        + self.peer_heartbeats.capacity() * (8 + mem::size_of::<Instant>())
+    }
+
+    pub fn calc_raft_memory_usage(&self) -> usize {
+        self.raft_group.raft.calc_memory_usage()
     }
 
     pub fn destroy(&mut self) -> Result<()> {
