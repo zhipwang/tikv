@@ -12,6 +12,7 @@
 // limitations under the License.
 
 
+use std::mem;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::fmt::{self, Debug, Display, Formatter};
@@ -1121,6 +1122,7 @@ pub enum Task {
     Applies(Vec<Apply>),
     Registration(Registration),
     Propose(Propose),
+    CalcMemory,
     Destroy(Destroy),
 }
 
@@ -1163,6 +1165,7 @@ impl Display for Task {
             Task::Registration(ref r) => {
                 write!(f, "[region {}] Reg {:?}", r.region.get_id(), r.apply_state)
             }
+            Task::CalcMemory => write!(f, "calculate memory usage"),
             Task::Destroy(ref d) => write!(f, "[region {}] destroy", d.region_id),
         }
     }
@@ -1320,6 +1323,14 @@ impl Runner {
         }
     }
 
+    fn handle_memory_calculation(&self) {
+        let mut usage = self.delegates.capacity() * (8 + mem::size_of::<ApplyDelegate>());
+        for (_, delegate) in &self.delegates {
+            usage += delegate.pending_cmds.normals.capacity() * mem::size_of::<PendingCmd>();
+        }
+        STORE_MEM_USAGE.with_label_values(&["apply"]).set(usage as f64);
+    }
+
     fn handle_shutdown(&mut self) {
         for p in self.delegates.values_mut() {
             p.clear_pending_commands();
@@ -1333,6 +1344,7 @@ impl Runnable<Task> for Runner {
             Task::Applies(a) => self.handle_applies(a),
             Task::Propose(p) => self.handle_propose(p),
             Task::Registration(s) => self.handle_registration(s),
+            Task::CalcMemory => self.handle_memory_calculation(),
             Task::Destroy(d) => self.handle_destroy(d),
         }
     }
