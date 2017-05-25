@@ -239,6 +239,7 @@ pub struct Scheduler {
 
     // worker pool
     worker_pool: ThreadPool,
+    high_pri_pool: ThreadPool,
 
     has_gc_command: bool,
 
@@ -263,6 +264,7 @@ impl Scheduler {
             sched_too_busy_threshold: sched_too_busy_threshold,
             worker_pool: ThreadPool::new_with_name(thd_name!("sched-worker-pool"),
                                                    worker_pool_size),
+            higt_pri_pool: ThreadPool::new_with_name(thd_name!("sched-high-pri-pool"), 1),
             has_gc_command: false,
             running_write_count: 0,
         }
