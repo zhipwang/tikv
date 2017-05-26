@@ -37,7 +37,7 @@ use std::sync::mpsc::Receiver;
 
 use threadpool::ThreadPool;
 use prometheus::HistogramTimer;
-use kvproto::kvrpcpb::{Context, LockInfo};
+use kvproto::kvrpcpb::{Context, LockInfo, CommandPri};
 
 use storage::{Engine, Command, Snapshot, StorageCb, Result as StorageResult,
               Error as StorageError, ScanMode, Statistics};
@@ -239,6 +239,8 @@ pub struct Scheduler {
 
     // worker pool
     worker_pool: ThreadPool,
+
+    // pool for high priority command
     high_pri_pool: ThreadPool,
 
     has_gc_command: bool,
@@ -264,7 +266,7 @@ impl Scheduler {
             sched_too_busy_threshold: sched_too_busy_threshold,
             worker_pool: ThreadPool::new_with_name(thd_name!("sched-worker-pool"),
                                                    worker_pool_size),
-            higt_pri_pool: ThreadPool::new_with_name(thd_name!("sched-high-pri-pool"), 1),
+            high_pri_pool: ThreadPool::new_with_name(thd_name!("sched-high-pri-pool"), 1),
             has_gc_command: false,
             running_write_count: 0,
         }
@@ -637,9 +639,16 @@ impl Scheduler {
             cmd.mut_context().set_term(term);
         }
         let ch = self.schedch.clone();
-        let readcmd = cmd.readonly();
-        if readcmd {
-            self.worker_pool.execute(move || process_read(cid, cmd, ch, snapshot));
+        let read_cmd = cmd.readonly();
+        let high_pri_cmd = cmd.priority() == CommandPri::High;
+        if read_cmd {
+            if high_pri_cmd {
+                self.high_pri_pool.execute(move || process_read(cid, cmd, ch, snapshot));
+            } else {
+                self.worker_pool.execute(move || process_read(cid, cmd, ch, snapshot));
+            }
+        } else if high_pri_cmd {
+            self.high_pri_pool.execute(move || process_write(cid, cmd, ch, snapshot));
         } else {
             self.worker_pool.execute(move || process_write(cid, cmd, ch, snapshot));
         }

@@ -72,7 +72,7 @@ impl Mutation {
     }
 }
 
-use kvproto::kvrpcpb::Context;
+use kvproto::kvrpcpb::{Context, CommandPri};
 
 pub enum StorageCb {
     Boolean(Callback<()>),
@@ -219,6 +219,22 @@ impl Debug for Command {
 pub const CMD_TAG_GC: &'static str = "gc";
 
 impl Command {
+    pub fn priority(&self) -> CommandPri {
+        match *self {
+            Command::Get { ref ctx, .. } |
+            Command::BatchGet { ref ctx, .. } |
+            Command::Scan { ref ctx, .. } |
+            Command::Prewrite { ref ctx, .. } |
+            Command::Commit { ref ctx, .. } |
+            Command::Cleanup { ref ctx, .. } |
+            Command::Rollback { ref ctx, .. } |
+            Command::ScanLock { ref ctx, .. } |
+            Command::ResolveLock { ref ctx, .. } |
+            Command::Gc { ref ctx, .. } |
+            Command::RawGet { ref ctx, .. } => ctx.get_priority(),
+        }
+    }
+
     pub fn readonly(&self) -> bool {
         match *self {
             Command::Get { .. } |
