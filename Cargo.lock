@@ -266,7 +266,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "grpc"
 version = "0.1.0"
-source = "git+https://github.com/pingcap/grpc-rs.git?branch=busyjay/dev#9557a91a6359d01729f5154d3425733f518c663c"
+source = "git+https://github.com/pingcap/grpc-rs.git?branch=busyjay/dev#0c90d371a760c627e1b713119d62f5775627b485"
 dependencies = [
  "futures 0.1.13 (registry+https://github.com/rust-lang/crates.io-index)",
  "grpc-sys 0.1.0 (git+https://github.com/pingcap/grpc-rs.git?branch=busyjay/dev)",
@@ -277,7 +277,7 @@ dependencies = [
 [[package]]
 name = "grpc-sys"
 version = "0.1.0"
-source = "git+https://github.com/pingcap/grpc-rs.git?branch=busyjay/dev#9557a91a6359d01729f5154d3425733f518c663c"
+source = "git+https://github.com/pingcap/grpc-rs.git?branch=busyjay/dev#0c90d371a760c627e1b713119d62f5775627b485"
 dependencies = [
  "cmake 0.1.22 (registry+https://github.com/rust-lang/crates.io-index)",
  "gcc 0.3.35 (registry+https://github.com/rust-lang/crates.io-index)",
